@@ -1,0 +1,390 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Print-clean rules ───────────────────────────────────────────────────────
+   Hide all app chrome (sidebars, headers, footers, toolbars, navigation,
+   chat widgets, toast containers, modals, decorative elements) when the
+   user prints the page. The main content keeps printing — and any element
+   tagged `data-print="hidden"` or `.no-print` is forced off. Anything tagged
+   `.print-only` becomes visible. Tables get clean borders + page-break
+   hints so multi-page invoices/orders look right.
+*/
+@media print {
+    /* App chrome */
+    header,
+    nav,
+    aside,
+    footer,
+    [role="navigation"],
+    [data-print="hidden"],
+    .no-print,
+    .print-hide,
+    /* Floating UI we never want on paper */
+    .toaster,
+    [data-sonner-toaster],
+    .floating-chat,
+    [data-floating-ui-portal],
+    /* Action toolbars / sticky bars */
+    .print-toolbar,
+    button[type="button"][data-action="print"],
+    /* Sticky panels from admin layouts */
+    .sticky.top-0.z-40,
+    .sticky.top-0.z-50 {
+        display: none !important;
+    }
+
+    /* Force-show print-only elements */
+    .print-only {
+        display: block !important;
+    }
+
+    /* Strip backgrounds + shadows for ink-friendly output */
+    *, *::before, *::after {
+        background: transparent !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+    }
+
+    body {
+        background: white !important;
+        color: black !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    /* Force main content to fill the page */
+    main {
+        display: block !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    /* Page-break hints */
+    .page-break-before { page-break-before: always; }
+    .page-break-after  { page-break-after: always; }
+    .avoid-break       { page-break-inside: avoid; }
+    table { page-break-inside: auto; }
+    tr    { page-break-inside: avoid; page-break-after: auto; }
+
+    /* Anchor links: show the URL after the link text */
+    a[href]:not([href^="#"])::after {
+        content: " (" attr(href) ")";
+        font-size: 0.85em;
+        color: #555;
+    }
+}
+
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+  display: flex;
+  width: max-content;
+  animation: marquee 30s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+
+@layer base {
+    :root {
+        /* Professional B2B - Glass & Classic Edition */
+        --background: 216 25% 96%; /* #F2F4F7 Cool Gray */
+        --foreground: 0 0% 18%;    /* #2E2E2E Dark Gray */
+        --card: 0 0% 100%;
+        --card-foreground: 222 47% 11%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 222 47% 11%;
+
+        /* Primary: Navy Blue #0A1A2F (ATLANTIS Master) */
+        --primary: 215 65% 11%;
+        --primary-foreground: 210 40% 98%;
+
+        /* Sidebar: Navy Blue #0A1A2F */
+        --sidebar: 215 65% 11%;
+        --sidebar-foreground: 210 40% 98%;
+
+        /* Secondary: Aqua #1BC7C9 (ATLANTIS Highlight) */
+        --secondary: 181 76% 45%;
+        --secondary-foreground: 215 65% 11%;
+
+        /* Accent/Alert: Orange #FF8A00 (ATLANTIS Alerts/Offers) */
+        --accent: 32 100% 50%;
+        --accent-foreground: 0 0% 100%;
+
+        --muted: 210 40% 96%;
+        --muted-foreground: 215 16% 47%;
+
+        --border: 214 32% 91%;
+        --input: 214 32% 91%;
+        --ring: 214 65% 11%;
+        --radius: 1rem;
+
+        --glass-bg: rgba(255, 255, 255, 0.7);
+        --glass-border: rgba(255, 255, 255, 0.3);
+        --glass-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
+    }
+
+    .dark {
+        /* Atlantis Official Palette - Dark Mode */
+        --background: 216 60% 5%;    /* #050B14 Deep Base */
+        --foreground: 210 40% 98%;   /* #E6EDF3 Primary Text */
+        --card: 215 59% 13%;         /* #0E1F36 Surface */
+        --card-foreground: 210 40% 98%;
+        --popover: 213 57% 17%;      /* #132A46 Elevated */
+        --popover-foreground: 210 40% 98%;
+
+        /* Primary: Navy Blue #0A1A2F (For Headers & Primary Buttons) */
+        --primary: 215 65% 11%;
+        --primary-foreground: 210 40% 98%;
+
+        /* Sidebar: Navy Blue #0A1A2F */
+        --sidebar: 215 65% 11%;
+        --sidebar-foreground: 210 40% 98%;
+
+        /* Secondary: Aqua #1BC7C9 (Secondary Elements) */
+        --secondary: 181 76% 45%;
+        --secondary-foreground: 215 65% 11%;
+
+        /* Accent: Orange #FF8A00 (For Offers/Alerts) */
+        --accent: 32 100% 50%;
+        --accent-foreground: 0 0% 100%;
+
+        --muted: 215 32% 12%;
+        --muted-foreground: 215 20% 65%;
+
+        --border: 215 32% 15%;
+        --input: 215 32% 15%;
+        --ring: 181 77% 40%;
+
+        --glass-bg: rgba(14, 31, 54, 0.8);
+        --glass-border: rgba(255, 255, 255, 0.05);
+        --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+    }
+
+    /* Force light mode for auth pages that use hardcoded light-mode colors */
+    .force-light,
+    .force-light * {
+        --foreground: 0 0% 18%;
+        --card: 216 25% 96%;
+        --card-foreground: 0 0% 18%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 0 0% 18%;
+        --primary: 214 65% 11%;
+        --primary-foreground: 0 0% 100%;
+        --secondary: 181 76% 45%;
+        --secondary-foreground: 214 65% 11%;
+        --accent: 32 100% 50%;
+        --accent-foreground: 0 0% 100%;
+        --muted: 216 10% 88%;
+        --muted-foreground: 0 0% 40%;
+        --border: 216 15% 88%;
+        --input: 216 15% 88%;
+        --ring: 214 65% 11%;
+        --sidebar: 215 65% 11%;
+        --sidebar-foreground: 210 40% 98%;
+        color-scheme: light;
+    }
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+
+    html {
+        overscroll-behavior: none;
+    }
+
+    body {
+        @apply bg-background text-foreground antialiased;
+        font-feature-settings: "rlig" 1, "calt" 1;
+        overflow-x: hidden;
+        width: 100%;
+        position: relative;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    /* Responsive Typography with clamp() */
+    h1 {
+        @apply font-heading text-4xl sm:text-5xl lg:text-7xl font-bold tracking-tight;
+    }
+
+    h2 {
+        @apply font-heading text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight;
+    }
+
+    h3 {
+        @apply font-heading text-2xl sm:text-3xl font-bold;
+    }
+
+    h4 {
+        @apply font-heading text-xl font-bold;
+    }
+}
+
+@layer components {
+    .glass {
+        background: var(--glass-bg);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid var(--glass-border);
+        box-shadow: var(--glass-shadow);
+    }
+
+    .glass-card {
+        @apply glass rounded-2xl;
+    }
+
+    .glass-card-strong {
+        @apply glass rounded-2xl border-primary/20;
+    }
+
+    .btn-primary {
+        @apply bg-primary text-primary-foreground font-black px-6 py-2.5 rounded-2xl transition-all hover:scale-105 active:scale-95 shadow-lg shadow-primary/20;
+    }
+
+    .btn-secondary {
+        @apply bg-secondary text-secondary-foreground font-black px-6 py-2.5 rounded-2xl transition-all hover:scale-105 active:scale-95 shadow-lg shadow-secondary/20;
+    }
+
+    .btn-glass {
+        @apply glass font-bold px-6 py-2.5 rounded-2xl hover:bg-primary/10 transition-all;
+    }
+
+    .premium-shadow {
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.1);
+    }
+}
+
+/* Smooth color transitions for dark mode — scoped to interactive elements only */
+body,
+nav,
+header,
+footer,
+a,
+button,
+.glass,
+.glass-card,
+.glass-card-strong,
+.trust-card {
+    transition-property: background-color, border-color, color;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 200ms;
+}
+
+/* Fix for Chrome autofill */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 30px #FFFFFF inset !important;
+    -webkit-text-fill-color: #0F1111 !important;
+    transition: background-color 5000s ease-in-out 0s;
+}
+
+
+
+/* Brand Logos Marquee Animation */
+@keyframes marquee {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+    animation: marquee 40s linear infinite;
+}
+
+/* Hide scrollbar utility */
+.scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+    display: none;
+}
+
+/* =====================================================================
+   DARK MODE OVERRIDES for admin/supplier dashboard pages
+   The dashboard uses concrete Tailwind utility classes (bg-white, slate, etc.).
+   These rules invert those tokens when html has the .dark class so the
+   theme toggle in the navbar produces a real dark experience without
+   rewriting every admin page.
+   ===================================================================== */
+html.dark body {
+    background-color: #0a0f1c;
+    color: #e2e8f0;
+}
+
+/* Backgrounds */
+html.dark .bg-white { background-color: #0f172a !important; }
+html.dark .bg-white\/5 { background-color: rgba(255,255,255,0.04) !important; }
+html.dark .bg-white\/10 { background-color: rgba(255,255,255,0.08) !important; }
+html.dark .bg-slate-50 { background-color: #111827 !important; }
+html.dark .bg-slate-100 { background-color: #1e293b !important; }
+html.dark .bg-slate-200 { background-color: #334155 !important; }
+html.dark .bg-slate-50\/30, html.dark .bg-slate-50\/50 { background-color: rgba(30,41,59,0.5) !important; }
+html.dark .bg-teal-50, html.dark .bg-teal-50\/30, html.dark .bg-teal-50\/50 { background-color: rgba(20,184,166,0.10) !important; }
+
+/* Text */
+html.dark .text-slate-900,
+html.dark .text-gray-900 { color: #f1f5f9 !important; }
+html.dark .text-slate-700 { color: #cbd5e1 !important; }
+html.dark .text-slate-600 { color: #cbd5e1 !important; }
+html.dark .text-slate-500 { color: #94a3b8 !important; }
+html.dark .text-slate-400 { color: #64748b !important; }
+html.dark .text-slate-300 { color: #475569 !important; }
+html.dark .text-\[\#0F172A\],
+html.dark .text-\[\#0B1F3A\],
+html.dark .text-\[\#111827\] { color: #f1f5f9 !important; }
+
+/* Borders */
+html.dark .border-slate-100 { border-color: #1e293b !important; }
+html.dark .border-slate-200 { border-color: #334155 !important; }
+html.dark .border-slate-300 { border-color: #475569 !important; }
+html.dark .border-\[\#E5E7EB\] { border-color: #334155 !important; }
+html.dark .divide-slate-50 > * + * { border-color: #1e293b !important; }
+
+/* Hover states */
+html.dark .hover\:bg-slate-50:hover { background-color: #1e293b !important; }
+html.dark .hover\:bg-slate-100:hover { background-color: #1e293b !important; }
+html.dark .hover\:bg-white:hover { background-color: #1e293b !important; }
+
+/* Inputs / selects */
+html.dark input,
+html.dark select,
+html.dark textarea {
+    background-color: #1e293b !important;
+    color: #f1f5f9 !important;
+    border-color: #334155 !important;
+}
+html.dark input::placeholder,
+html.dark textarea::placeholder { color: #64748b !important; }
+
+/* Modal overlay tweak */
+html.dark .bg-slate-900\/60 { background-color: rgba(0,0,0,0.7) !important; }
+
+/* Shadows softening */
+html.dark .shadow-sm { box-shadow: 0 1px 2px rgba(0,0,0,0.4) !important; }
+html.dark .shadow-xl,
+html.dark .shadow-2xl { box-shadow: 0 25px 60px rgba(0,0,0,0.5) !important; }
+
+/* Brand marquee — single direction, smooth */
+@keyframes marquee-ltr {
+    from { transform: translateX(0); }
+    to   { transform: translateX(-50%); }
+}
+.animate-marquee-ltr {
+    animation: marquee-ltr 40s linear infinite;
+}
+.animate-marquee-ltr:hover {
+    animation-play-state: paused;
+}

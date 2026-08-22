@@ -1,0 +1,464 @@
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+  Logger,
+} from '@nestjs/common';
+import { KYCStatus } from '@prisma/client';
+import { PrismaService } from '../common/prisma.service';
+import { EmailService } from '../email/email.service';
+import { AiAgentService } from '../ai-agent/ai-agent.service';
+import { NotificationsService } from '../notifications/notifications.service';
+
+@Injectable()
+export class KycService {
+  private readonly logger = new Logger(KycService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private emailService: EmailService,
+    private aiAgent: AiAgentService,
+    private notificationsService: NotificationsService,
+  ) {}
+
+  /** Submit or re-submit KYC documents */
+  async submitKyc(
+    userId: string,
+    data: {
+      documentType: string;
+      frontImageUrl: string;
+      backImageUrl?: string;
+      selfieUrl?: string;
+      livenessScore?: number;
+    },
+  ) {
+    // Validate document type
+    const validTypes = ['NATIONAL_ID', 'PASSPORT', 'DRIVING_LICENSE', 'RESIDENCE_PERMIT'];
+    if (!validTypes.includes(data.documentType)) {
+      throw new BadRequestException(`Invalid document type. Allowed: ${validTypes.join(', ')}`);
+    }
+
+    // Must have frontImage
+    if (!data.frontImageUrl) {
+      throw new BadRequestException('Front image is required');
+    }
+
+    // Check if user already has a pending/verified doc
+    const existing = await this.prisma.kYCDocument.findFirst({
+      where: { userId, status: { in: [KYCStatus.VERIFIED] } },
+    });
+    if (existing) {
+      throw new ForbiddenException('Your identity is already verified');
+    }
+
+    // Calculate basic liveness score if not provided (placeholder — replace with real AI check)
+    const livenessScore = data.livenessScore ?? (data.selfieUrl ? 0.85 : null);
+
+    // Upsert: update if PENDING/REJECTED exists, else create
+    const existingDoc = await this.prisma.kYCDocument.findFirst({
+      where: { userId, status: { in: [KYCStatus.PENDING, KYCStatus.REJECTED] } },
+    });
+
+    if (existingDoc) {
+      return this.prisma.kYCDocument.update({
+        where: { id: existingDoc.id },
+        data: {
+          documentType: data.documentType,
+          frontImageUrl: data.frontImageUrl,
+          backImageUrl: data.backImageUrl ?? null,
+          selfieUrl: data.selfieUrl ?? null,
+          livenessScore,
+          status: KYCStatus.PENDING,
+          adminNotes: null,
+        },
+      });
+    }
+
+    const doc = await this.prisma.kYCDocument.create({
+      data: {
+        userId,
+        documentType: data.documentType,
+        frontImageUrl: data.frontImageUrl,
+        backImageUrl: data.backImageUrl ?? null,
+        selfieUrl: data.selfieUrl ?? null,
+        livenessScore,
+        status: KYCStatus.PENDING,
+      },
+    });
+
+    // Update user kycStatus to PENDING
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: { kycStatus: KYCStatus.PENDING },
+      select: { email: true, name: true },
+    });
+
+    // Platform notification for User
+    await this.notificationsService.notifyUser(
+      userId,
+      'KYC Submitted Successfully',
+      'Your identity documents have been submitted and are under review. We\'ll notify you once reviewed — usually within 24 hours.',
+      'INFO'
+    ).catch(() => {});
+
+    // Platform notification for Admins
+    await this.notificationsService.notifyAdmins(
+      'New KYC Submission',
+      `${updatedUser.name} (${updatedUser.email}) has submitted KYC documents for review.`,
+      'INFO',
+      { userId, docId: doc.id }
+    ).catch(() => {});
+
+    // Email notification
+    if (updatedUser.email) {
+      this.emailService.sendKycStatusEmail(
+        updatedUser.email,
+        updatedUser.name || 'Partner',
+        'PENDING',
+      ).catch(() => {});
+    }
+    // Trigger Smart AI Verification (Background)
+    this.runSmartVerification(doc.id).catch(err => this.logger.error(`[KYC_PROCESSOR_FAIL]: ${err.message}`));
+
+    return doc;
+  }
+
+  /**
+   * AI Identity Analysis using Gemini Vision.
+   *
+   * Decision flow based on the AI's recommendation:
+   *   AUTO_APPROVE   → high-confidence pass (faces match, country
+   *                    matches, name matches, doc looks real). KYC
+   *                    flips to VERIFIED automatically.
+   *   AUTO_REJECT    → AI is sure the doc is fake / faces clearly
+   *                    don't match / blocked country. Flips to
+   *                    REJECTED automatically.
+   *   MANUAL_REVIEW  → ambiguous (low light, partial obscure,
+   *                    different name spelling). Stays PENDING and
+   *                    a human admin reviews. The AI's full report
+   *                    is stored on adminNotes so the admin sees
+   *                    everything the AI saw.
+   *
+   * Stores a structured AI report on the doc so the admin UI can
+   * render face-match / country-match / name-match badges next to
+   * the human review controls.
+   */
+  private async runSmartVerification(docId: string) {
+    this.logger.log(`[KYC_AI_PROCESSOR] Starting AI analysis for doc: ${docId}`);
+
+    const doc = await this.prisma.kYCDocument.findUnique({
+      where: { id: docId },
+      include: { user: true },
+    });
+
+    if (!doc || doc.status !== KYCStatus.PENDING) return;
+
+    try {
+        const result = await this.aiAgent.verifyKYCDocument(
+            doc.frontImageUrl,
+            doc.backImageUrl || undefined,
+            doc.selfieUrl || undefined,
+            (doc as any).user?.country || undefined,
+            (doc as any).user?.name || undefined,
+        );
+
+        // Build a human-readable summary that any admin can scan in
+        // 5 seconds — used as adminNotes when we approve/reject AND
+        // when the row stays PENDING for human review.
+        const lines: string[] = [];
+        lines.push(`AI confidence: ${(result.confidence * 100).toFixed(0)}%`);
+        lines.push(`Document: ${result.documentValid ? '✅ valid' : '❌ invalid'} (${result.documentType || 'unknown type'})`);
+        if (result.countryDetected) {
+            lines.push(`Country: ${result.countryDetected}${result.countryMatch === false ? ' ⚠ does NOT match declared' : result.countryMatch === true ? ' ✅' : ''}`);
+        }
+        if (doc.selfieUrl) {
+            lines.push(`Face match: ${result.faceMatch === true ? '✅ matches' : result.faceMatch === false ? '❌ different person' : '— inconclusive'}${result.faceMatchConfidence != null ? ` (${(result.faceMatchConfidence * 100).toFixed(0)}%)` : ''}`);
+        }
+        if (result.nameOnDocument) {
+            lines.push(`Name on doc: ${result.nameOnDocument}${result.nameMatch === false ? ' ⚠ does NOT match declared' : result.nameMatch === true ? ' ✅' : ''}`);
+        }
+        lines.push(`Recommendation: ${result.recommendation}`);
+        lines.push(`Summary: ${result.reason}`);
+        const aiReport = lines.join('\n');
+
+        // Persist liveness score for the existing dashboard widgets
+        // (uses faceMatchConfidence when present, else overall).
+        const liveness = result.faceMatchConfidence ?? result.confidence ?? null;
+        await this.prisma.kYCDocument.update({
+            where: { id: doc.id },
+            data: { livenessScore: liveness },
+        });
+
+        if (result.recommendation === 'AUTO_APPROVE') {
+            this.logger.log(`[KYC_AI_PROCESSOR] AUTO_APPROVE doc ${docId}: ${result.reason}`);
+            await this.verifyKyc(doc.id, `AI auto-approved\n\n${aiReport}`);
+            return;
+        }
+        if (result.recommendation === 'AUTO_REJECT') {
+            this.logger.warn(`[KYC_AI_PROCESSOR] AUTO_REJECT doc ${docId}: ${result.reason}`);
+            await this.rejectKyc(doc.id, `AI auto-rejected\n\n${aiReport}`);
+            return;
+        }
+        // MANUAL_REVIEW — leave PENDING but persist the AI's findings
+        // so the admin can decide quickly with full context.
+        this.logger.log(`[KYC_AI_PROCESSOR] MANUAL_REVIEW doc ${docId}: ${result.reason}`);
+        await this.prisma.kYCDocument.update({
+            where: { id: doc.id },
+            data: { adminNotes: `AI flagged for manual review\n\n${aiReport}` },
+        });
+    } catch (err: any) {
+        this.logger.error(`[KYC_AI_PROCESSOR] Critical failure: ${err?.message || err}`);
+    }
+  }
+
+  /** Get KYC status for the current user */
+  async getMyKycStatus(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { kycStatus: true },
+    });
+
+    const doc = await this.prisma.kYCDocument.findFirst({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return { kycStatus: user?.kycStatus, document: doc };
+  }
+
+  /** Admin: get all pending KYC submissions */
+  async getAllPending() {
+    return this.prisma.kYCDocument.findMany({
+      where: { status: KYCStatus.PENDING },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true, createdAt: true },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  /** Admin: get all KYC submissions (with optional filter) */
+  async getAll(status?: KYCStatus) {
+    return this.prisma.kYCDocument.findMany({
+      where: status ? { status } : {},
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  /** Admin: get KYC document by ID */
+  async getById(docId: string) {
+    const doc = await this.prisma.kYCDocument.findUnique({
+      where: { id: docId },
+      include: {
+        user: {
+          select: { id: true, name: true, email: true, role: true },
+        },
+      },
+    });
+    if (!doc) throw new NotFoundException('KYC document not found');
+    return doc;
+  }
+
+  /** Admin: verify (approve) a KYC document */
+  async verifyKyc(docId: string, adminNotes?: string) {
+    const doc = await this.prisma.kYCDocument.findUnique({
+      where: { id: docId },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    if (!doc) throw new NotFoundException('KYC document not found');
+
+    const updated = await this.prisma.kYCDocument.update({
+      where: { id: docId },
+      data: { status: KYCStatus.VERIFIED, adminNotes: adminNotes ?? null },
+    });
+
+    // Update user kycStatus
+    await this.prisma.user.update({
+      where: { id: doc.userId },
+      data: { kycStatus: KYCStatus.VERIFIED },
+    });
+
+    // Send email notification
+    if (doc.user?.email) {
+      this.emailService.sendKycStatusEmail(doc.user.email, doc.user.name || 'Partner', 'VERIFIED').catch(() => {});
+    }
+
+    // Platform notification
+    await this.notificationsService.notifyUser(
+      doc.userId,
+      'Identity Verified',
+      'Congratulations! Your identity has been verified. You now have full access to listing and trading.',
+      'SUCCESS'
+    ).catch(() => {});
+
+    return updated;
+  }
+
+  /**
+   * Admin: revoke a previously-verified KYC. Flips the document
+   * status back to PENDING and the user's kycStatus to UNVERIFIED
+   * so they have to resubmit. Useful when fraud is detected after
+   * approval, when a KYC expires, or when the admin needs to
+   * re-validate after a country/legal-entity change.
+   */
+  async revokeKyc(docId: string, adminNotes: string) {
+    const reason = (adminNotes || '').trim() || 'Admin revoked verification.';
+    const doc = await this.prisma.kYCDocument.findUnique({
+      where: { id: docId },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    if (!doc) throw new NotFoundException('KYC document not found');
+
+    const updated = await this.prisma.kYCDocument.update({
+      where: { id: docId },
+      data: {
+        status: KYCStatus.PENDING,
+        adminNotes: `Verification revoked — ${reason}`,
+      },
+    });
+
+    await this.prisma.user.update({
+      where: { id: doc.userId },
+      data: { kycStatus: KYCStatus.UNVERIFIED },
+    });
+
+    if (doc.user?.email) {
+      this.emailService.sendKycStatusEmail(
+        doc.user.email,
+        doc.user.name || 'Partner',
+        'REJECTED',
+        `Your previously-approved verification has been revoked. ${reason}`,
+      ).catch(() => {});
+    }
+
+    await this.notificationsService.notifyUser(
+      doc.userId,
+      'Identity Verification Revoked',
+      `Your KYC verification was revoked. Reason: ${reason}. Please resubmit.`,
+      'ERROR',
+    ).catch(() => {});
+
+    return updated;
+  }
+
+  /**
+   * Admin: re-sync the user's kycStatus from the latest KYCDocument
+   * row. Handles the rare case where the User.kycStatus column got
+   * out of sync with the document table (e.g. an old DB import or a
+   * partial migration). Cheap to run, safe to re-run.
+   */
+  async resyncKycStatus(userId: string) {
+    const latest = await this.prisma.kYCDocument.findFirst({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+    const target = latest?.status ?? KYCStatus.UNVERIFIED;
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { kycStatus: target },
+    });
+    return { userId, kycStatus: target };
+  }
+
+  /** Admin: reject a KYC document */
+  async rejectKyc(docId: string, adminNotes: string) {
+    if (!adminNotes?.trim()) {
+      throw new BadRequestException('Admin notes are required when rejecting KYC');
+    }
+
+    const doc = await this.prisma.kYCDocument.findUnique({
+      where: { id: docId },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    });
+    if (!doc) throw new NotFoundException('KYC document not found');
+
+    const updated = await this.prisma.kYCDocument.update({
+      where: { id: docId },
+      data: { status: KYCStatus.REJECTED, adminNotes },
+    });
+
+    // Update user kycStatus back to UNVERIFIED so they can resubmit
+    await this.prisma.user.update({
+      where: { id: doc.userId },
+      data: { kycStatus: KYCStatus.UNVERIFIED },
+    });
+
+    // Send rejection email with notes
+    if (doc.user?.email) {
+      this.emailService.sendKycStatusEmail(doc.user.email, doc.user.name || 'Partner', 'REJECTED', adminNotes).catch(() => {});
+    }
+
+    // Platform notification
+    await this.notificationsService.notifyUser(
+      doc.userId,
+      'Identity Verification Failed',
+      `Your KYC submission was rejected. Reason: ${adminNotes}`,
+      'ERROR'
+    ).catch(() => {});
+
+    return updated;
+  }
+
+  /** Stats for admin dashboard */
+  async getStats() {
+    const [pending, verified, rejected, unverified] = await Promise.all([
+      this.prisma.kYCDocument.count({ where: { status: KYCStatus.PENDING } }),
+      this.prisma.kYCDocument.count({ where: { status: KYCStatus.VERIFIED } }),
+      this.prisma.kYCDocument.count({ where: { status: KYCStatus.REJECTED } }),
+      this.prisma.user.count({ where: { kycStatus: KYCStatus.UNVERIFIED } }),
+    ]);
+    return { pending, verified, rejected, unverified };
+  }
+
+  /** Quick verify multiple users by email (dev/admin utility) */
+  async quickVerifyByEmails(emails: string[]) {
+    const results = [];
+    for (const email of emails) {
+      try {
+        const user = await this.prisma.user.findUnique({ where: { email } });
+        if (!user) {
+          results.push({ email, status: 'USER_NOT_FOUND' });
+          continue;
+        }
+
+        let doc = await this.prisma.kYCDocument.findFirst({ where: { userId: user.id } });
+
+        if (doc) {
+          await this.prisma.kYCDocument.update({
+            where: { id: doc.id },
+            data: { status: KYCStatus.VERIFIED, livenessScore: 1.0 },
+          });
+        } else {
+          doc = await this.prisma.kYCDocument.create({
+            data: {
+              userId: user.id,
+              documentType: 'PASSPORT',
+              frontImageUrl: 'admin-quick-verified',
+              livenessScore: 1.0,
+              status: KYCStatus.VERIFIED,
+            },
+          });
+        }
+
+        await this.prisma.user.update({
+          where: { id: user.id },
+          data: { kycStatus: KYCStatus.VERIFIED },
+        });
+
+        results.push({ email, status: 'VERIFIED', userId: user.id, docId: doc.id });
+        this.logger.log(`[QUICK_VERIFY] User ${email} (${user.id}) verified`);
+      } catch (err) {
+        results.push({ email, status: 'ERROR', error: err.message });
+      }
+    }
+    return results;
+  }
+}

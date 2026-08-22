@@ -1,0 +1,25 @@
+import { Module } from '@nestjs/common';
+import { ProductsService } from './products.service';
+import { ProductsController } from './products.controller';
+import { PlacementService } from './placement.service';
+import { PlacementController } from './placement.controller';
+import { PricingModule } from '../pricing/pricing.module';
+import { AiAgentModule } from '../ai-agent/ai-agent.module';
+import { EanService } from './ean.service';
+import { EanCacheService } from './ean-cache.service';
+import { EanValidatorService } from './ean-validator.service';
+import { ExcelService } from '../admin/excel.service';
+import { ReviewsService } from './reviews.service';
+import { ReviewsController, AdminReviewsController } from './reviews.controller';
+
+import { StorageModule } from '../storage/storage.module';
+import { NotificationsModule } from '../notifications/notifications.module';
+import { EmailModule } from '../email/email.module';
+
+@Module({
+    imports: [PricingModule, AiAgentModule, StorageModule, NotificationsModule, EmailModule],
+    providers: [ProductsService, PlacementService, EanService, EanCacheService, EanValidatorService, ExcelService, ReviewsService],
+    controllers: [ProductsController, PlacementController, ReviewsController, AdminReviewsController],
+    exports: [ProductsService, PlacementService],
+})
+export class ProductsModule { }

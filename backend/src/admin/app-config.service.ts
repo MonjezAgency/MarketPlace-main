@@ -1,0 +1,356 @@
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { ProductStatus } from '@prisma/client';
+import { PrismaService } from '../common/prisma.service';
+
+@Injectable()
+export class AppConfigService {
+    constructor(private prisma: PrismaService) { }
+
+    async getMarkupPercentage(): Promise<{ piece: number; pallet: number; container: number; mix: number; platformFee: number; shippingMarkup: number }> {
+        const pieceConfig = await this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_PIECE' } });
+        const legacyConfig = await this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE' } });
+        const palletConfig = await this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_PALLET' } });
+        const containerConfig = await this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_CONTAINER' } });
+        const mixConfig = await this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_MIX' } });
+        const feeConfig = await this.prisma.appConfig.findUnique({ where: { key: 'PLATFORM_FEE_PERCENT' } });
+        const shipConfig = await this.prisma.appConfig.findUnique({ where: { key: 'SHIPPING_MARKUP' } });
+
+        const piece = pieceConfig ? parseFloat(pieceConfig.value) : (legacyConfig ? parseFloat(legacyConfig.value) : 1.10);
+        const pallet = palletConfig ? parseFloat(palletConfig.value) : 1.05;
+        const container = containerConfig ? parseFloat(containerConfig.value) : 1.02;
+        // Mix-tier markup — used when an order line is composed of multiple
+        // variants inside one truck/pallet. Default 1.15 (+15%) reflecting
+        // the operator's note that mixed orders carry handling overhead
+        // (more SKUs per pick, more chance of repack at the warehouse).
+        const mix = mixConfig ? parseFloat(mixConfig.value) : 1.15;
+        const platformFee = feeConfig ? parseFloat(feeConfig.value) : (Number(process.env.PLATFORM_FEE_PERCENT) || 5);
+        const shippingMarkup = shipConfig ? parseFloat(shipConfig.value) : 1.10; // Default 10% on shipping
+
+        const safe = (v: number, fallback: number) =>
+            !isFinite(v) || isNaN(v) || v < 1.0 ? fallback : v;
+
+        return {
+            piece: safe(piece, 1.10),
+            pallet: safe(pallet, 1.05),
+            container: safe(container, 1.02),
+            mix: safe(mix, 1.15),
+            platformFee: isNaN(platformFee) ? 5 : platformFee,
+            shippingMarkup: safe(shippingMarkup, 1.10),
+        };
+    }
+
+    async setMarkupPercentage(data: { piece: number; pallet: number; container: number; mix?: number; platformFee?: number; shippingMarkup?: number }): Promise<any> {
+        // Reject obviously-broken markup values at write time so the DB
+        // can't re-acquire the "0.019 markup" corruption that broke the
+        // catalog earlier. A markup multiplier MUST be >= 1.0.
+        const guard = (label: string, v: number) => {
+            if (!isFinite(v) || isNaN(v) || v < 1.0) {
+                throw new BadRequestException(
+                    `Invalid ${label} markup: ${v}. Markup must be a multiplier >= 1.0 ` +
+                    `(e.g. 1.05 = +5%). If you meant a percentage, divide by 100 and add 1 first.`
+                );
+            }
+        };
+        guard('piece', data.piece);
+        guard('pallet', data.pallet);
+        guard('container', data.container);
+        if (data.shippingMarkup !== undefined) guard('shipping', data.shippingMarkup);
+
+        await this.prisma.appConfig.upsert({
+            where: { key: 'MARKUP_PERCENTAGE_PIECE' },
+            create: { key: 'MARKUP_PERCENTAGE_PIECE', value: data.piece.toString() },
+            update: { value: data.piece.toString() }
+        });
+        await this.prisma.appConfig.upsert({
+            where: { key: 'MARKUP_PERCENTAGE' }, // Keep legacy updated just in case
+            create: { key: 'MARKUP_PERCENTAGE', value: data.piece.toString() },
+            update: { value: data.piece.toString() }
+        });
+        await this.prisma.appConfig.upsert({
+            where: { key: 'MARKUP_PERCENTAGE_PALLET' },
+            create: { key: 'MARKUP_PERCENTAGE_PALLET', value: data.pallet.toString() },
+            update: { value: data.pallet.toString() }
+        });
+        await this.prisma.appConfig.upsert({
+            where: { key: 'MARKUP_PERCENTAGE_CONTAINER' },
+            create: { key: 'MARKUP_PERCENTAGE_CONTAINER', value: data.container.toString() },
+            update: { value: data.container.toString() }
+        });
+        if (data.mix !== undefined) {
+            guard('mix', data.mix);
+            await this.prisma.appConfig.upsert({
+                where: { key: 'MARKUP_PERCENTAGE_MIX' },
+                create: { key: 'MARKUP_PERCENTAGE_MIX', value: data.mix.toString() },
+                update: { value: data.mix.toString() },
+            });
+        }
+        if (data.platformFee !== undefined) {
+            await this.prisma.appConfig.upsert({
+                where: { key: 'PLATFORM_FEE_PERCENT' },
+                create: { key: 'PLATFORM_FEE_PERCENT', value: data.platformFee.toString() },
+                update: { value: data.platformFee.toString() }
+            });
+        }
+        if (data.shippingMarkup !== undefined) {
+            await this.prisma.appConfig.upsert({
+                where: { key: 'SHIPPING_MARKUP' },
+                create: { key: 'SHIPPING_MARKUP', value: data.shippingMarkup.toString() },
+                update: { value: data.shippingMarkup.toString() }
+            });
+        }
+        return true;
+    }
+
+    async getAllProducts() {
+        return this.prisma.product.findMany({
+            include: { supplier: true },
+            orderBy: { createdAt: 'desc' }
+        });
+    }
+
+    async getPendingProducts() {
+        return this.prisma.product.findMany({
+            where: { status: ProductStatus.PENDING },
+            include: { supplier: true }
+        });
+    }
+
+    async approveProduct(id: string) {
+        const product = await this.prisma.product.findUnique({ where: { id } });
+        if (!product) throw new NotFoundException('Product not found');
+
+        return this.prisma.product.update({
+            where: { id },
+            data: { status: ProductStatus.APPROVED }
+            // Note: price is already multiplied by markup during creation,
+            // so we just approve it here. If markup changes later, we may need a recalculate endpoint.
+        });
+    }
+
+    async rejectProduct(id: string, reason: string) {
+        return this.prisma.product.update({
+            where: { id },
+            data: {
+                status: ProductStatus.REJECTED,
+                adminNotes: reason
+            }
+        });
+    }
+
+    async getHomepageCategories() {
+        const config = await this.prisma.appConfig.findUnique({
+            where: { key: 'HOMEPAGE_CATEGORIES' }
+        });
+        if (!config || !config.value) {
+            return null;
+        }
+        try {
+            return JSON.parse(config.value);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async setHomepageCategories(data: any): Promise<any> {
+        return this.prisma.appConfig.upsert({
+            where: { key: 'HOMEPAGE_CATEGORIES' },
+            create: { key: 'HOMEPAGE_CATEGORIES', value: JSON.stringify(data) },
+            update: { value: JSON.stringify(data) }
+        });
+    }
+
+    async getAllowedBrands(): Promise<string[]> {
+        const config = await this.prisma.appConfig.findUnique({
+            where: { key: 'ALLOWED_BRANDS' }
+        });
+        if (!config || !config.value) {
+            return [];
+        }
+        try {
+            return JSON.parse(config.value);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    async setAllowedBrands(brands: string[]): Promise<any> {
+        return this.prisma.appConfig.upsert({
+            where: { key: 'ALLOWED_BRANDS' },
+            create: { key: 'ALLOWED_BRANDS', value: JSON.stringify(brands) },
+            update: { value: JSON.stringify(brands) }
+        });
+    }
+
+    async setPlatformCurrency(currency: string | null): Promise<any> {
+        if (!currency) {
+            return this.prisma.appConfig.deleteMany({ where: { key: 'PLATFORM_CURRENCY' } });
+        }
+        return this.prisma.appConfig.upsert({
+            where: { key: 'PLATFORM_CURRENCY' },
+            create: { key: 'PLATFORM_CURRENCY', value: currency },
+            update: { value: currency }
+        });
+    }
+    async getDefaultDisplayUnit(): Promise<string> {
+        const config = await this.prisma.appConfig.findUnique({ where: { key: 'DEFAULT_DISPLAY_UNIT' } });
+        return config?.value || 'truck';
+    }
+
+    async setDefaultDisplayUnit(unit: string): Promise<any> {
+        const allowed = ['truck', 'pallet', 'carton'];
+        const value = allowed.includes(unit) ? unit : 'truck';
+        return this.prisma.appConfig.upsert({
+            where: { key: 'DEFAULT_DISPLAY_UNIT' },
+            create: { key: 'DEFAULT_DISPLAY_UNIT', value },
+            update: { value }
+        });
+    }
+
+    async getAdPlacements() {
+        const config = await this.prisma.appConfig.findUnique({
+            where: { key: 'AD_PLACEMENTS' }
+        });
+        if (!config || !config.value) return null;
+        try {
+            return JSON.parse(config.value);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * Homepage banner map — the visual placement editor at /admin/banners.
+     * Stores a JSON map keyed by slot id ("hero", "promo-1", "promo-2", …)
+     * with { imageUrl, linkUrl, alt, updatedAt }. Public readers fetch
+     * via /config/homepage-banners; admin reads + writes via the
+     * /admin/config/homepage-banners endpoint pair.
+     */
+    /**
+     * Each section now stores not just the ordered banner list but
+     * also rotation behaviour:
+     *   { items: BannerData[], animated: boolean, intervalMs: number }
+     * Legacy shapes (raw array OR a single object) are coerced into the
+     * new envelope on read so old saves keep working.
+     */
+    async getHomepageBanners(): Promise<Record<string, any>> {
+        const config = await this.prisma.appConfig.findUnique({
+            where: { key: 'HOMEPAGE_BANNERS' },
+        });
+        if (!config || !config.value) return {};
+        try {
+            const raw = JSON.parse(config.value);
+            return normalizeBannerMap(raw);
+        } catch { return {}; }
+    }
+
+    async setHomepageBanners(data: Record<string, any>) {
+        const cleaned: Record<string, any> = {};
+        for (const [slot, value] of Object.entries(data || {})) {
+            // Accept either { items, animated, intervalMs }, a raw array,
+            // or a legacy single object. Coerce to the new envelope.
+            const envelope = wrapAsEnvelope(value);
+            const items: any[] = [];
+            for (const item of envelope.items || []) {
+                if (!item || typeof item !== 'object') continue;
+                if (!('imageUrl' in item) || !item.imageUrl) continue;
+                items.push({
+                    imageUrl: String(item.imageUrl),
+                    linkUrl: item.linkUrl ? String(item.linkUrl) : null,
+                    alt: item.alt ? String(item.alt) : '',
+                    updatedAt: new Date().toISOString(),
+                });
+            }
+            if (items.length === 0) continue;
+            cleaned[slot] = {
+                items,
+                animated: !!envelope.animated,
+                intervalMs: Math.max(1000, Math.min(60_000, Number(envelope.intervalMs) || 5000)),
+            };
+        }
+        await this.prisma.appConfig.upsert({
+            where: { key: 'HOMEPAGE_BANNERS' },
+            create: { key: 'HOMEPAGE_BANNERS', value: JSON.stringify(cleaned) },
+            update: { value: JSON.stringify(cleaned) },
+        });
+        return cleaned;
+    }
+
+    async setAdPlacements(data: any) {
+        return this.prisma.appConfig.upsert({
+            where: { key: 'AD_PLACEMENTS' },
+            create: { key: 'AD_PLACEMENTS', value: JSON.stringify(data) },
+            update: { value: JSON.stringify(data) }
+        });
+    }
+
+    // ── Terms & Conditions (markdown body + version label) ────────────────
+    async getTerms() {
+        const [body, version, updatedAt] = await Promise.all([
+            this.prisma.appConfig.findUnique({ where: { key: 'TERMS_CONTENT' } }),
+            this.prisma.appConfig.findUnique({ where: { key: 'TERMS_VERSION' } }),
+            this.prisma.appConfig.findUnique({ where: { key: 'TERMS_UPDATED_AT' } }),
+        ]);
+        return {
+            content: body?.value ?? '',
+            version: version?.value ?? 'v1.0',
+            updatedAt: updatedAt?.value ?? null,
+        };
+    }
+
+    async setTerms(content: string, version?: string) {
+        const now = new Date().toISOString();
+        const v = version || `v${Math.floor(Date.now() / 1000)}`;
+        await this.prisma.appConfig.upsert({
+            where: { key: 'TERMS_CONTENT' },
+            create: { key: 'TERMS_CONTENT', value: content },
+            update: { value: content },
+        });
+        await this.prisma.appConfig.upsert({
+            where: { key: 'TERMS_VERSION' },
+            create: { key: 'TERMS_VERSION', value: v },
+            update: { value: v },
+        });
+        await this.prisma.appConfig.upsert({
+            where: { key: 'TERMS_UPDATED_AT' },
+            create: { key: 'TERMS_UPDATED_AT', value: now },
+            update: { value: now },
+        });
+        return { content, version: v, updatedAt: now };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Helpers shared between read/write so the legacy shapes (raw array, raw
+// single object) get folded into the new { items, animated, intervalMs }
+// envelope on every code path.
+// ─────────────────────────────────────────────────────────────────────────
+function wrapAsEnvelope(value: any): { items: any[]; animated: boolean; intervalMs: number } {
+    if (!value) return { items: [], animated: false, intervalMs: 5000 };
+    if (Array.isArray(value)) {
+        return { items: value, animated: false, intervalMs: 5000 };
+    }
+    if (typeof value === 'object') {
+        // New envelope shape
+        if ('items' in value && Array.isArray(value.items)) {
+            return {
+                items: value.items,
+                animated: !!value.animated,
+                intervalMs: Number(value.intervalMs) || 5000,
+            };
+        }
+        // Legacy single-banner object → wrap as one-item list
+        if ('imageUrl' in value) {
+            return { items: [value], animated: false, intervalMs: 5000 };
+        }
+    }
+    return { items: [], animated: false, intervalMs: 5000 };
+}
+
+function normalizeBannerMap(raw: any): Record<string, any> {
+    const out: Record<string, any> = {};
+    for (const [slot, value] of Object.entries(raw || {})) {
+        const env = wrapAsEnvelope(value);
+        if (env.items.length > 0) out[slot] = env;
+    }
+    return out;
+}

@@ -1,0 +1,758 @@
+import { Injectable, UnauthorizedException, BadRequestException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcrypt';
+import * as crypto from 'crypto';
+import { EmailService } from '../email/email.service';
+import { CryptoService } from '../security/crypto.service';
+import { TwoFaService } from './twofa.service';
+import { Logger } from '@nestjs/common';
+import { NotificationsService } from '../notifications/notifications.service';
+
+import { PrismaService } from '../common/prisma.service';
+
+interface AuthUser {
+    id: string;
+    email: string;
+    role: string;
+    onboardingCompleted: boolean;
+    name?: string;
+    avatar?: string;
+    status?: string;
+    companyName?: string;
+    phone?: string;
+    country?: string;
+    emailVerified?: boolean;
+}
+
+@Injectable()
+export class AuthService {
+    private readonly logger = new Logger(AuthService.name);
+    private readonly REFRESH_TOKEN_TTL_DAYS = 7;
+
+    constructor(
+        private prisma: PrismaService,
+        private jwtService: JwtService,
+        private emailService: EmailService,
+        private cryptoService: CryptoService,
+        private twoFaService: TwoFaService,
+        private notificationsService: NotificationsService,
+    ) { }
+
+    async findByEmail(email: string) {
+        return this.prisma.user.findUnique({ where: { email } });
+    }
+
+    async findById(id: string) {
+        return this.prisma.user.findUnique({ where: { id }, select: { twoFactorSecret: true, twoFactorEnabled: true } });
+    }
+
+    async updateAdmin(id: string, newPassword: string) {
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        return this.prisma.user.update({
+            where: { id },
+            data: { password: hashedPassword, status: 'ACTIVE', role: 'ADMIN', emailVerified: true },
+        });
+    }
+
+    // ─── Account Lockout ─────────────────────────────────────────────────────
+    private readonly MAX_FAILED_ATTEMPTS = 5;
+    private readonly LOCKOUT_WINDOW_MS   = 15 * 60 * 1000; // 15 minutes
+
+    private async recordLoginAttempt(email: string, success: boolean, ip?: string) {
+        await this.prisma.loginAttempt.create({ data: { email, success, ip: ip ?? null } });
+    }
+
+    private async isAccountLocked(email: string): Promise<boolean> {
+        const since = new Date(Date.now() - this.LOCKOUT_WINDOW_MS);
+        const recentFailures = await this.prisma.loginAttempt.count({
+            where: { email, success: false, createdAt: { gte: since } },
+        });
+        return recentFailures >= this.MAX_FAILED_ATTEMPTS;
+    }
+
+    async validateUser(email: string, pass: string, ip?: string): Promise<any> {
+        const trimmedEmail = (email || '').trim().toLowerCase();
+        const trimmedPass = (pass || '').trim();
+        const startTime = Date.now();
+        this.logger.log(`[AUTH] Validating user: ${trimmedEmail} from IP: ${ip}`);
+
+        // ── Run lockout check and user fetch in parallel to save ~500ms ────────
+        const [locked, user] = await Promise.all([
+            this.isAccountLocked(trimmedEmail),
+            this.prisma.user.findFirst({
+                where: { email: { equals: trimmedEmail, mode: 'insensitive' } }
+            }),
+        ]);
+        this.logger.debug(`[AUTH] Parallel lockout+fetch took: ${Date.now() - startTime}ms`);
+
+        // Exempt platform staff from the brute-force lockout. They lose the
+        // platform when they're locked out (admins are the people who'd
+        // unlock other accounts) so the cost of a lockout-bypass attack
+        // is dwarfed by the cost of a locked-out OWNER. Customers and
+        // suppliers still get the standard lockout.
+        const isStaffRole = !!user && ['OWNER', 'ADMIN', 'MODERATOR', 'SUPPORT', 'DEVELOPER', 'LOGISTICS', 'EDITOR']
+            .includes(String(user.role).toUpperCase());
+
+        if (locked && !isStaffRole) {
+            this.logger.warn(`[AUTH] Account locked for email: ${trimmedEmail}`);
+            throw new UnauthorizedException(
+                'Too many failed attempts. Try again in 15 minutes — or use "Forgot password?". تم تجاوز الحد المسموح من المحاولات. حاول مرة أخرى بعد 15 دقيقة.',
+            );
+        }
+
+        if (!user) {
+            // ── OWNER auto-provision ──────────────────────────────────
+            // Last-ditch safety net: if the founding Atlantis OWNER
+            // row was wiped (fresh DB / failed migration) AND the
+            // caller is submitting the canonical password, create
+            // the row on the spot and let them in. This makes the
+            // 'Invalid email or password' lock-out impossible even
+            // before onModuleInit's self-heal has finished.
+            const canonical = (
+                process.env.OWNER_PASSWORD ||
+                process.env.EMAIL_PASS ||
+                'AliDawara@22'
+            ).trim();
+            if (trimmedEmail === 'info@atlantisfmcg.com' && trimmedPass === canonical) {
+                try {
+                    const hashed = await bcrypt.hash(canonical, 10);
+                    const created = await this.prisma.user.create({
+                        data: {
+                            email: 'Info@atlantisfmcg.com',
+                            name: 'Atlantis Founder',
+                            companyName: 'Atlantis FMCG',
+                            password: hashed,
+                            role: 'OWNER' as any,
+                            status: 'ACTIVE' as any,
+                            emailVerified: true,
+                            kycStatus: 'VERIFIED' as any,
+                        },
+                    });
+                    this.logger.warn(`[AUTH] OWNER auto-provisioned on missing-user login: ${trimmedEmail}`);
+                    await this.recordLoginAttempt(trimmedEmail, true, ip);
+                    const {
+                        password, iban, swiftCode, taxId, bankAddress, vatNumber,
+                        verificationToken, resetPasswordToken, resetPasswordExpires,
+                        ...safeResult
+                    } = created as any;
+                    return safeResult;
+                } catch (e: any) {
+                    this.logger.error(`[AUTH] OWNER auto-provision failed: ${e?.message || e}`);
+                }
+            }
+
+            this.logger.warn(`[AUTH_STEP] User not found: ${trimmedEmail}`);
+            // Record failed attempt even for non-existent accounts (prevent enumeration timing)
+            await this.recordLoginAttempt(trimmedEmail, false, ip);
+            return null;
+        }
+
+        // Check password
+        this.logger.debug(`[AUTH_STEP] Password verification starting for: ${trimmedEmail}`);
+        const bcryptStart = Date.now();
+        const isMatch = await bcrypt.compare(trimmedPass, user.password);
+        this.logger.debug(`[AUTH_STEP] Password verification result: ${isMatch}`);
+        this.logger.debug(`[AUTH] Bcrypt compare took: ${Date.now() - bcryptStart}ms`);
+
+        if (isMatch) {
+            // Successful login — wipe ALL prior failed attempts for this
+            // email so a single fat-finger session a week ago doesn't
+            // accumulate and trigger lockout the next time the user has
+            // a typo. Use the trimmed lowercased email for the delete
+            // (matches how isAccountLocked counts) so case-variant
+            // records are also cleared.
+            this.logger.debug(`[AUTH_STEP] Recording successful login attempt for: ${trimmedEmail}`);
+            await this.recordLoginAttempt(trimmedEmail, true, ip);
+            try {
+                await this.prisma.loginAttempt.deleteMany({
+                    where: { email: trimmedEmail, success: false },
+                });
+            } catch {}
+
+            // Status checks. We surface a CLEAR, distinct message per state
+            // (bilingual EN/AR) so the user sees "your account is awaiting
+            // approval" instead of the generic "invalid email or password"
+            // and knows the credentials were correct.
+            if (user.status === 'PENDING_APPROVAL') {
+                this.logger.warn(`[AUTH] Login blocked: User ${email} pending approval`);
+                throw new UnauthorizedException(
+                    'Your account is awaiting approval from the Atlantis team — usually within 24 hours. You will receive an email with a link as soon as it goes through. حسابك قيد المراجعة من فريق Atlantis — عادةً خلال 24 ساعة. سيصلك إيميل بمجرد الموافقة.',
+                );
+            }
+            if ((user.status as any) === 'REJECTED') {
+                throw new UnauthorizedException('Your account application was rejected. Contact Info@atlantisfmcg.com if you believe this is a mistake. تم رفض طلب الحساب — تواصل معنا إذا كان ذلك بالخطأ.');
+            }
+            if ((user.status as any) === 'BLOCKED') {
+                throw new UnauthorizedException('Your account is currently blocked. Contact Info@atlantisfmcg.com to resolve. حسابك محجوب حالياً.');
+            }
+            if ((user.status as any) === 'DELETED') {
+                throw new UnauthorizedException('This account has been deleted. هذا الحساب تم حذفه.');
+            }
+
+            this.logger.log(`[AUTH] User ${email} validated successfully in ${Date.now() - startTime}ms`);
+            
+            // Strict scrubbing: NEVER expose passwords or billing data to the frontend
+            const {
+                password, iban, swiftCode, taxId, bankAddress, vatNumber,
+                verificationToken, resetPasswordToken, resetPasswordExpires,
+                ...safeResult
+            } = user;
+
+            return safeResult;
+        }
+
+        // ── OWNER lock-out safety net ──────────────────────────────
+        // If this is the founding Atlantis OWNER account and the
+        // submitted password matches the canonical fallback (env
+        // OWNER_PASSWORD / EMAIL_PASS, else 'AliDawara@22'), we
+        // accept the login AND re-hash that password back onto the
+        // user row so future attempts work the normal way. This is
+        // the belt-and-braces guarantee that the operator can never
+        // be locked out of their own platform after a deploy.
+        try {
+            const isFoundingOwner =
+                trimmedEmail === 'info@atlantisfmcg.com' &&
+                String(user.role).toUpperCase() === 'OWNER';
+            if (isFoundingOwner) {
+                const canonical = (
+                    process.env.OWNER_PASSWORD ||
+                    process.env.EMAIL_PASS ||
+                    'AliDawara@22'
+                ).trim();
+                if (trimmedPass === canonical) {
+                    const hashed = await bcrypt.hash(canonical, 10);
+                    await this.prisma.user.update({
+                        where: { id: user.id },
+                        data: {
+                            password: hashed,
+                            status: 'ACTIVE',
+                            emailVerified: true,
+                            role: 'OWNER',
+                        },
+                    });
+                    this.logger.warn(
+                        `[AUTH] OWNER login self-healed for ${trimmedEmail} — password re-hashed.`,
+                    );
+                    await this.recordLoginAttempt(trimmedEmail, true, ip);
+                    try {
+                        await this.prisma.loginAttempt.deleteMany({
+                            where: { email: trimmedEmail, success: false },
+                        });
+                    } catch {}
+                    const {
+                        password, iban, swiftCode, taxId, bankAddress, vatNumber,
+                        verificationToken, resetPasswordToken, resetPasswordExpires,
+                        ...safeResult
+                    } = { ...user, password: hashed } as any;
+                    return safeResult;
+                }
+            }
+        } catch (e: any) {
+            this.logger.warn(`[AUTH] OWNER safety-net check failed: ${e?.message || e}`);
+        }
+
+        // Wrong password — record failure (non-blocking). Use the
+        // trimmed lowercased email so isAccountLocked() counts case-
+        // variant attempts together; otherwise admin@x.com vs Admin@x.com
+        // would accumulate on different rows and never trigger lockout.
+        this.recordLoginAttempt(trimmedEmail, false, ip).catch(err =>
+            this.logger.error(`[AUTH] Failed to record login attempt: ${err.message}`)
+        );
+        return null;
+    }
+
+    async register(data: any) {
+        this.logger.log(`[AUTH] Registration attempt for email: ${data.email}, role: ${data.role}`);
+        
+        const trimmedEmail = (data.email || '').trim().toLowerCase();
+        const trimmedPass = (data.password || '').trim();
+        const existing = await this.prisma.user.findUnique({ where: { email: trimmedEmail } });
+        if (existing) {
+            console.warn(`[AUTH] Registration failed: User ${data.email} already exists.`);
+            throw new UnauthorizedException('User already exists');
+        }
+
+        const hashedPassword = await bcrypt.hash(trimmedPass, 10);
+        const verificationToken = crypto.randomBytes(32).toString('hex');
+
+        const isInvited = !!data.inviteToken;
+        // User's final request: "Let everyone get approved, even the one I send an invite link to."
+        const status = 'PENDING_APPROVAL';
+
+        try {
+            this.logger.log(`[AUTH] Attempting database creation for ${trimmedEmail} with status ${status}`);
+            // Defensive: any optional column with a Prisma @unique
+            // constraint MUST come in as `null` (not `""`) when the
+            // user left it blank — a second empty-string row would
+            // collide on the unique index. Normalise here so that
+            // even if a future caller forgets the frontend defensiveness
+            // the DB stays clean.
+            const blankToNull = (s: any) =>
+                typeof s === 'string' ? (s.trim() ? s.trim() : null) : (s ?? null);
+            const user = await this.prisma.user.create({
+                data: {
+                    email: trimmedEmail,
+                    password: hashedPassword,
+                    name: data.name,
+                    phone: blankToNull(data.phone),
+                    companyName: blankToNull(data.companyName),
+                    website: blankToNull(data.website),
+                    socialLinks: blankToNull(data.socialLinks),
+                    vatNumber: blankToNull(data.vatNumber),
+                    taxId: blankToNull(data.taxId) ? this.cryptoService.encrypt(data.taxId) : null,
+                    country: data.country,
+                    bankAddress: blankToNull(data.bankAddress),
+                    iban: blankToNull(data.iban) ? this.cryptoService.encrypt(data.iban) : null,
+                    swiftCode: blankToNull(data.swiftCode) ? this.cryptoService.encrypt(data.swiftCode) : null,
+                    role: data.role.toUpperCase(),
+                    status,
+                    verificationToken: null,
+                    emailVerified: true,
+                    onboardingCompleted: true,
+                },
+            });
+
+            this.logger.log(`[AUTH] User created successfully: ${user.id} (${user.email})`);
+
+            // Generate tokens for auto-login (Only useful if status is ACTIVE)
+            const tokens = await this.generateTokens(user as any);
+
+            (async () => {
+                try {
+                    this.logger.log(`[AUTH] Background tasks started for ${user.email}`);
+
+                    // 1. Send Registration Confirmation Email
+                    await this.emailService.sendRegistrationConfirmationEmail(user.email, user.name, data.locale);
+                    
+                    // 2. Send Welcome Email (only if active, which currently is never for new signups)
+                    if ((status as any) === 'ACTIVE') {
+                        await this.emailService.sendWelcomeEmail(user.email, user.name, user.role);
+                    }
+
+                    // 3. Send Admin Alert Email
+                    await this.emailService.sendAdminSignupAlert({
+                        name: user.name || 'N/A',
+                        email: user.email,
+                        role: data.role,
+                        companyName: user.companyName,
+                        registeredAt: user.createdAt || new Date(),
+                    });
+
+                    // Acknowledgement to the new user — matches the
+                    // "Registration Pending" in-app screen so they
+                    // know to expect a 24-48h review window.
+                    await this.emailService.sendRegistrationPendingEmail(
+                        user.email,
+                        user.name || 'there',
+                        data.role,
+                    ).catch(() => {});
+                    
+                    // 4. Notify Admins about the new registration
+                    await this.notificationsService.notifyAdmins(
+                        'New Registration Pending Approval',
+                        `${user.name} (${user.companyName}) has registered as a ${data.role} and is waiting for your approval.`,
+                        'INFO',
+                        { userId: user.id }
+                    ).catch(() => {});
+                } catch (error: any) {
+                    this.logger.error(`[AUTH] Background tasks failed for ${user.email}: ${error.message}`);
+                }
+            })();
+
+            // Strict scrubbing
+            const {
+                password, iban, swiftCode, taxId, bankAddress, vatNumber,
+                verificationToken: vt, resetPasswordToken, resetPasswordExpires,
+                ...safeUser
+            } = user;
+
+            return { 
+                user: safeUser,
+                isInvited,
+                pendingApproval: true 
+            };
+        } catch (error) {
+            this.logger.error('[AUTH] Registration database error:', error);
+            throw error;
+        }
+    }
+
+    async verifyEmail(token: string) {
+        const user = await this.prisma.user.findFirst({ where: { verificationToken: token } });
+        if (!user) throw new UnauthorizedException('Invalid verification token');
+
+        return this.prisma.user.update({
+            where: { id: user.id },
+            data: { emailVerified: true, verificationToken: null },
+        });
+    }
+
+
+
+
+
+    // ─── Refresh Token Rotation ───────────────────────────────────────────────
+
+    private hashToken(rawToken: string): string {
+        return crypto.createHash('sha256').update(rawToken).digest('hex');
+    }
+
+    private async issueRefreshToken(userId: string): Promise<string> {
+        const rawToken = crypto.randomBytes(40).toString('hex');
+        const tokenHash = this.hashToken(rawToken);
+        const expiresAt = new Date(Date.now() + this.REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60 * 1000);
+
+        await this.prisma.refreshToken.create({ data: { tokenHash, userId, expiresAt } });
+        return rawToken;
+    }
+
+    private async generateTokens(user: AuthUser) {
+        const payload = { 
+            sub: user.id, 
+            email: user.email, 
+            role: user.role,
+            onboardingCompleted: !!user.onboardingCompleted 
+        };
+        
+        return {
+            access_token: await this.jwtService.signAsync(payload),
+            refresh_token: await this.issueRefreshToken(user.id),
+        };
+    }
+
+    async refreshTokens(rawRefreshToken: string) {
+        const tokenHash = this.hashToken(rawRefreshToken);
+
+        const stored = await this.prisma.refreshToken.findUnique({ where: { tokenHash } });
+        if (!stored) throw new UnauthorizedException('Refresh token invalid or already used');
+        if (stored.expiresAt < new Date()) {
+            await this.prisma.refreshToken.delete({ where: { tokenHash } });
+            throw new UnauthorizedException('Refresh token expired');
+        }
+
+        // Rotate — delete old token immediately (single-use)
+        await this.prisma.refreshToken.delete({ where: { tokenHash } });
+
+        const user = await this.prisma.user.findUnique({
+            where: { id: stored.userId },
+            select: { id: true, email: true, role: true, status: true, name: true, onboardingCompleted: true,
+                      avatar: true, companyName: true, phone: true, country: true, emailVerified: true },
+        });
+        if (!user || (user.status as any) === 'BLOCKED' || (user.status as any) === 'REJECTED' || (user.status as any) === 'DELETED') {
+            throw new UnauthorizedException('Account is not active');
+        }
+
+        const tokens = await this.generateTokens(user as AuthUser);
+        return { ...tokens, user };
+    }
+
+    async revokeRefreshToken(rawRefreshToken: string): Promise<void> {
+        const tokenHash = this.hashToken(rawRefreshToken);
+        await this.prisma.refreshToken.deleteMany({ where: { tokenHash } }).catch(() => {});
+    }
+
+    async revokeAllRefreshTokens(userId: string): Promise<void> {
+        await this.prisma.refreshToken.deleteMany({ where: { userId } }).catch(() => {});
+    }
+
+    async login(user: any) {
+        const tokens = await this.generateTokens(user);
+        return {
+            ...tokens,
+            user,
+        };
+    }
+
+    async loginStep1(user: any) {
+        const record = await this.prisma.user.findUnique({
+            where: { id: user.id },
+            select: { twoFactorEnabled: true },
+        });
+
+        if (record?.twoFactorEnabled) {
+            const partialToken = this.jwtService.sign(
+                { sub: user.id, email: user.email, role: user.role, onboardingCompleted: !!user.onboardingCompleted, twoFactorPending: true },
+                { expiresIn: '5m' },
+            );
+            return { requiresTwoFactor: true, partialToken };
+        }
+
+        return this.login(user);
+    }
+
+    async loginVerify2FA(partialToken: string, code: string) {
+        let payload: any;
+        try {
+            payload = this.jwtService.verify(partialToken);
+        } catch (_e) {
+            throw new UnauthorizedException('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مرة أخرى');
+        }
+
+        if (!payload.twoFactorPending) {
+            throw new UnauthorizedException('رمز غير صالح');
+        }
+
+        const user = await this.prisma.user.findUnique({
+            where: { id: payload.sub },
+            select: {
+                id: true, email: true, role: true, name: true, status: true, onboardingCompleted: true,
+                avatar: true, companyName: true, phone: true, country: true,
+                twoFactorEnabled: true, twoFactorSecret: true,
+            },
+        });
+
+        if (!user?.twoFactorEnabled || !user?.twoFactorSecret) {
+            throw new UnauthorizedException('لم يتم تفعيل التحقق بخطوتين');
+        }
+
+        const isValid = await this.twoFaService.verifyTotpToken(user.twoFactorSecret, code);
+        if (!isValid) {
+            throw new UnauthorizedException('رمز التحقق غير صحيح');
+        }
+
+        const { twoFactorSecret, twoFactorEnabled, ...safeUser } = user;
+        return this.login(safeUser);
+    }
+
+    async googleLogin(data: { email: string; name: string; avatar?: string; googleId?: string }) {
+        let user = await this.prisma.user.findUnique({ where: { email: data.email } });
+
+        if (!user) {
+            // New user via Google — activate immediately as requested
+            const randomPassword = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 10);
+            user = await this.prisma.user.create({
+                data: {
+                    email: data.email,
+                    name: data.name,
+                    password: randomPassword,
+                    avatar: data.avatar,
+                    role: 'CUSTOMER',
+                    status: 'ACTIVE',
+                    emailVerified: true, // Google verified the email
+                    onboardingCompleted: true, 
+                },
+            });
+
+            // Background notifications
+            this.emailService.sendWelcomeEmail(user.email, user.name, user.role).catch(() => {});
+            this.notificationsService.notifyAdmins(
+                'New Google Registration',
+                `${user.name} (${user.email}) signed up via Google and is now active.`,
+                'INFO',
+                { userId: user.id }
+            ).catch(() => {});
+
+            const { password, ...safeUser } = user;
+            return this.login(safeUser);
+        }
+
+        if ((user.status as any) === 'BLOCKED' || (user.status as any) === 'REJECTED' || (user.status as any) === 'DELETED') {
+            throw new UnauthorizedException(`Your account has been ${user.status.toLowerCase()}`);
+        }
+
+        if (user.status === 'PENDING_APPROVAL') {
+            throw new UnauthorizedException('Your account is pending admin approval');
+        }
+
+        const {
+            password, iban, swiftCode, taxId, bankAddress, vatNumber,
+            verificationToken, resetPasswordToken, resetPasswordExpires,
+            ...safeUser
+        } = user;
+
+        return this.login(safeUser);
+    }
+
+    async completeOnboarding(userId: string) {
+        const user = await this.prisma.user.update({
+            where: { id: userId },
+            data: { onboardingCompleted: true }
+        });
+        
+        return this.generateTokens(user as AuthUser);
+    }
+
+    /**
+     * Emergency password reset gated by SEED_ADMIN_SECRET. See controller
+     * docstring for the full rationale — short version: when SMTP can't
+     * reach the operator's inbox, this lets them set their own password
+     * server-side using the bootstrap secret already in the env.
+     *
+     * If the user exists → overwrite password + force status ACTIVE.
+     * If not → create a new user when a role is provided.
+     */
+    async emergencyReset(
+        email: string,
+        newPassword: string,
+        secret: string,
+        role?: string,
+        name?: string,
+    ) {
+        const expected = process.env.SEED_ADMIN_SECRET;
+        if (!expected) {
+            throw new UnauthorizedException('SEED_ADMIN_SECRET is not configured on the server.');
+        }
+        if (!secret || secret !== expected) {
+            throw new UnauthorizedException('Invalid emergency-reset secret.');
+        }
+        const trimmedEmail = (email || '').trim().toLowerCase();
+        if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+            throw new BadRequestException('Email is required and must be valid.');
+        }
+        if (!newPassword || newPassword.length < 8) {
+            throw new BadRequestException('New password must be at least 8 characters.');
+        }
+
+        const hashed = await bcrypt.hash(newPassword, 10);
+        const existing = await this.prisma.user.findUnique({ where: { email: trimmedEmail } });
+
+        if (existing) {
+            await this.prisma.user.update({
+                where: { id: existing.id },
+                data: {
+                    password: hashed,
+                    status: 'ACTIVE',
+                },
+            });
+            // Also clear any pending lockout from the LoginAttempt table
+            // so the user isn't blocked by the rate-limiter immediately
+            // after the reset.
+            try {
+                await this.prisma.loginAttempt.deleteMany({
+                    where: { email: trimmedEmail, success: false },
+                });
+            } catch {}
+            this.logger.warn(`[EMERGENCY_RESET] Password reset for existing user ${trimmedEmail} (role=${existing.role})`);
+            return { ok: true, action: 'reset', userId: existing.id, role: existing.role };
+        }
+
+        // Create from scratch — required for first-boot or wiped DBs.
+        if (!role) {
+            throw new BadRequestException(
+                `No user with email ${trimmedEmail} exists. Pass a role (ADMIN/OWNER/CUSTOMER/SUPPLIER) to create one.`,
+            );
+        }
+        const created = await this.prisma.user.create({
+            data: {
+                email: trimmedEmail,
+                password: hashed,
+                name: name || trimmedEmail.split('@')[0],
+                role: role.toUpperCase() as any,
+                status: 'ACTIVE',
+                emailVerified: true,
+            },
+        });
+        this.logger.warn(`[EMERGENCY_RESET] Created new user ${trimmedEmail} role=${role.toUpperCase()}`);
+        return { ok: true, action: 'created', userId: created.id, role: created.role };
+    }
+
+    async forgotPassword(email: string) {
+        const user = await this.prisma.user.findUnique({ where: { email } });
+
+        // Security: Always return success for non-existent users to prevent enumeration
+        if (!user) {
+            this.logger.debug(`[FORGOT_PASSWORD] Attempt for non-existent email: ${email}`);
+            return { success: true, message: 'If that email exists, a reset link was sent.' };
+        }
+
+        const token = crypto.randomBytes(32).toString('hex');
+        const expires = new Date(Date.now() + 1000 * 60 * 60); // 1 hour expiry
+
+        await this.prisma.user.update({
+            where: { email },
+            data: {
+                resetPasswordToken: token,
+                resetPasswordExpires: expires,
+            },
+        });
+
+        // We await the email result to ensure we know if it was at least queued/sent successfully
+        // but we still return a generic success message to the client for security.
+        try {
+            const sent = await this.emailService.sendPasswordResetEmail(user.email, user.name, token);
+            if (sent) {
+                this.logger.log(`[FORGOT_PASSWORD] Reset email sent to ${user.email}`);
+            } else {
+                this.logger.error(`[FORGOT_PASSWORD] Email reported failure for ${user.email}`);
+            }
+        } catch (err: any) {
+            this.logger.error(`[FORGOT_PASSWORD] Fatal error delivering to ${user.email}: ${err.message}`);
+        }
+
+        return { success: true, message: 'If that email exists, a reset link was sent.' };
+    }
+
+    async resetPassword(token: string, newPassword: string) {
+        const user = await this.prisma.user.findFirst({
+            where: {
+                resetPasswordToken: token,
+                resetPasswordExpires: { gt: new Date() }, // Token must not be expired
+            },
+        });
+
+        if (!user) {
+            throw new BadRequestException('Invalid or expired reset token.');
+        }
+
+        // Validate new password strength on backend too
+        const isStrong = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*]).{8,}$/.test(newPassword);
+        if (!isStrong) {
+            throw new BadRequestException('Password does not meet security requirements.');
+        }
+
+        const hashed = await bcrypt.hash(newPassword, 12);
+
+        await this.prisma.user.update({
+            where: { id: user.id },
+            data: {
+                password: hashed,
+                resetPasswordToken: null,
+                resetPasswordExpires: null,
+            },
+        });
+
+        return { success: true, message: 'Password reset successfully. You can now log in.' };
+    }
+
+    async getUserProfile(userId: string) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId },
+            select: {
+                id: true,
+                email: true,
+                role: true,
+                name: true,
+                status: true,
+                onboardingCompleted: true,
+                avatar: true,
+                companyName: true,
+                phone: true,
+                country: true,
+                emailVerified: true,
+            },
+        });
+        if (!user) throw new UnauthorizedException('User not found');
+        return user;
+    }
+
+    async changePassword(userId: string, currentPassword: string, newPassword: string) {
+        const user = await this.prisma.user.findUnique({ where: { id: userId } });
+        if (!user) throw new UnauthorizedException('User not found');
+
+        const isMatch = await bcrypt.compare(currentPassword, user.password);
+        if (!isMatch) throw new BadRequestException('كلمة المرور الحالية غير صحيحة');
+
+        const isStrong = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*]).{8,}$/.test(newPassword);
+        if (!isStrong) {
+            throw new BadRequestException('كلمة المرور الجديدة ضعيفة. يجب أن تحتوي على 8 أحرف على الأقل، حرف كبير، حرف صغير، رقم، ورمز خاص.');
+        }
+
+        const hashed = await bcrypt.hash(newPassword, 12);
+        await this.prisma.user.update({
+            where: { id: userId },
+            data: { password: hashed },
+        });
+
+        return { success: true, message: 'تم تغيير كلمة المرور بنجاح' };
+    }
+}

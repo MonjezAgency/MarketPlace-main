@@ -1,0 +1,48 @@
+{
+  "dependencies": {
+    "@radix-ui/react-slot": "^1.0.2",
+    "@stripe/react-stripe-js": "^6.1.0",
+    "@stripe/stripe-js": "^9.1.0",
+    "axios": "^1.13.5",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.34.1",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.0",
+    "lucide-react": "^0.330.0",
+    "next": "^14.1.0",
+    "next-auth": "^4.24.5",
+    "next-themes": "^0.4.6",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-hot-toast": "^2.6.0",
+    "react-is": "^18.3.1",
+    "recharts": "^3.7.0",
+    "socket.io-client": "^4.8.3",
+    "tailwind-merge": "^2.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "autoprefixer": "^10.0.1",
+    "eslint": "8.57.0",
+    "eslint-config-next": "14.1.0",
+    "postcss": "^8",
+    "tailwindcss": "^3.3.0",
+    "tsx": "^4.7.1",
+    "typescript": "^5"
+  },
+  "engines": { "node": ">=18" },
+  "name": "b2b-marketplace-frontend",
+  "packageManager": "npm@10.5.0",
+  "private": true,
+  "scripts": {
+    "build": "npm run check:i18n && next build",
+    "check:i18n": "tsx scripts/check-i18n.ts",
+    "dev": "next dev",
+    "lint": "next lint",
+    "start": "next start"
+  },
+  "version": "0.1.0"
+}

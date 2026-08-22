@@ -1,0 +1,880 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from '../common/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import axios from 'axios';
+
+// Actions the agent is ALLOWED to take autonomously (safety guardrails)
+const ALLOWED_ACTIONS = new Set([
+    'SEND_NOTIFICATION',
+    'FLAG_ORDER_FOR_REVIEW',
+    'FLAG_PAYMENT_FOR_REVIEW',
+    // 'REMIND_KYC' is DISABLED — KYC enforcement is currently off on
+    // the platform (operator decision). The hourly agent was still
+    // pinging suppliers with "KYC Verification Required" even though
+    // we don't gate listings on it, so suppliers were getting noise
+    // for a feature they couldn't act on. Re-enable here when KYC
+    // is brought back as a hard requirement.
+    'LOG_ISSUE',
+    'APPROVE_KYC',
+    'REJECT_KYC',
+    'CATEGORIZE_PRODUCT',
+]);
+
+// Which auto-fix branches inside the scan are allowed to fire a
+// supplier-facing notification. We had two recurring spam sources:
+//   • KYC reminders — feature disabled, see ALLOWED_ACTIONS comment.
+//   • Rejected-product nudges — already surfaced as a status badge
+//     plus a "💬 View comment" pill on /supplier/products, and the
+//     admin comment flow sends a one-off email. An hourly cron-
+//     ping was redundant noise.
+// Flipping these to `false` stops the proactive pings without
+// gutting the scan — the issues still appear in /admin/ai-agent
+// for the admin to action manually.
+const SUPPLIER_PING_KYC_REMINDER = false;
+const SUPPLIER_PING_REJECTED_PRODUCT = false;
+
+export interface AgentReport {
+    id: string;
+    timestamp: Date;
+    issuesFound: number;
+    actionsToken: string[];
+    summary: string;
+    details: AgentIssue[];
+}
+
+export interface AgentIssue {
+    type: string;
+    severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+    description: string;
+    entityId?: string;
+    entityType?: string;
+    autoFixed: boolean;
+    fixDescription?: string;
+}
+
+@Injectable()
+export class AiAgentService {
+    private readonly logger = new Logger(AiAgentService.name);
+    private readonly openRouterUrl = 'https://openrouter.ai/api/v1/chat/completions';
+    private reports: AgentReport[] = [];
+
+    constructor(
+        private readonly prisma: PrismaService,
+        private readonly notifications: NotificationsService,
+    ) {}
+
+    // Run full marketplace health scan every hour
+    @Cron(CronExpression.EVERY_HOUR)
+    async runScheduledScan() {
+        this.logger.log('AI Agent: Starting scheduled marketplace scan...');
+        await this.runScan();
+    }
+
+    async runScan(): Promise<AgentReport> {
+        const issues: AgentIssue[] = [];
+        const actions: string[] = [];
+
+        await Promise.all([
+            this.checkStuckOrders(issues, actions),
+            this.checkFailedPayments(issues, actions),
+            this.checkPendingKYC(issues, actions),
+            this.checkRejectedProductsWithNoAction(issues, actions),
+            this.checkLowStockProducts(issues, actions),
+        ]);
+
+        const summary = await this.generateAISummary(issues);
+
+        const report: AgentReport = {
+            id: `scan_${Date.now()}`,
+            timestamp: new Date(),
+            issuesFound: issues.length,
+            actionsToken: actions,
+            summary,
+            details: issues,
+        };
+
+        // Keep last 50 reports in memory
+        this.reports.unshift(report);
+        if (this.reports.length > 50) this.reports.pop();
+
+        if (issues.length > 0) {
+            this.logger.warn(`AI Agent scan complete: ${issues.length} issues found, ${actions.length} auto-fixed`);
+        } else {
+            this.logger.log('AI Agent scan complete: Platform healthy ✓');
+        }
+
+        return report;
+    }
+
+    private async checkStuckOrders(issues: AgentIssue[], actions: string[]) {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+        const stuckOrders = await this.prisma.order.findMany({
+            where: { status: 'PENDING', createdAt: { lt: cutoff } },
+            take: 20,
+        });
+
+        for (const order of stuckOrders) {
+            issues.push({
+                type: 'STUCK_ORDER',
+                severity: 'HIGH',
+                description: `Order #${order.id} has been in PENDING status for over 24 hours`,
+                entityId: order.id,
+                entityType: 'Order',
+                autoFixed: false,
+            });
+
+            // Auto-fix: notify the customer
+            if (ALLOWED_ACTIONS.has('SEND_NOTIFICATION')) {
+                try {
+                    await this.notifications.create(
+                        order.customerId,
+                        'Order Update Required',
+                        `Your order #${order.id.slice(-8)} is still pending. Please complete payment or contact support.`,
+                        'WARNING',
+                        { orderId: order.id },
+                    );
+                    issues[issues.length - 1].autoFixed = true;
+                    issues[issues.length - 1].fixDescription = 'Sent reminder notification to customer';
+                    actions.push(`SEND_NOTIFICATION:order:${order.id}`);
+                } catch {}
+            }
+        }
+    }
+
+    private async checkFailedPayments(issues: AgentIssue[], actions: string[]) {
+        const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000); // 2 hours ago
+        const failedEscrows = await this.prisma.escrowTransaction.findMany({
+            where: {
+                status: 'HOLDING',
+                createdAt: { lt: cutoff },
+                order: { status: 'PENDING' },
+            },
+            include: { order: { select: { id: true, customerId: true } } },
+            take: 10,
+        }).catch(() => []);
+
+        for (const escrow of failedEscrows) {
+            issues.push({
+                type: 'STALE_ESCROW',
+                severity: 'CRITICAL',
+                description: `Escrow #${escrow.id} has been holding funds for over 2 hours without order confirmation`,
+                entityId: escrow.id,
+                entityType: 'EscrowTransaction',
+                autoFixed: false,
+                fixDescription: 'Flagged for manual admin review',
+            });
+            actions.push(`FLAG_PAYMENT_FOR_REVIEW:${escrow.id}`);
+        }
+    }
+
+    private async checkPendingKYC(issues: AgentIssue[], actions: string[]) {
+        const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000); // 48 hours ago
+        const pendingKyc = await this.prisma.user.findMany({
+            where: {
+                role: 'SUPPLIER',
+                kycStatus: 'UNVERIFIED',
+                createdAt: { lt: cutoff },
+                status: 'ACTIVE',
+            },
+            select: { id: true, name: true, email: true },
+            take: 20,
+        });
+
+        for (const user of pendingKyc) {
+            issues.push({
+                type: 'KYC_OVERDUE',
+                severity: 'MEDIUM',
+                description: `Supplier ${user.name} (${user.email}) has not submitted KYC after 48 hours`,
+                entityId: user.id,
+                entityType: 'User',
+                autoFixed: false,
+            });
+
+            if (SUPPLIER_PING_KYC_REMINDER && ALLOWED_ACTIONS.has('REMIND_KYC')) {
+                try {
+                    await this.notifications.create(
+                        user.id,
+                        'KYC Verification Required',
+                        'Please complete your identity verification to start selling. Go to Dashboard → KYC Verification.',
+                        'WARNING',
+                        { link: '/dashboard/kyc' },
+                    );
+                    issues[issues.length - 1].autoFixed = true;
+                    issues[issues.length - 1].fixDescription = 'Sent KYC reminder notification';
+                    actions.push(`REMIND_KYC:${user.id}`);
+                } catch {}
+            }
+        }
+    }
+
+    private async checkRejectedProductsWithNoAction(issues: AgentIssue[], actions: string[]) {
+        const cutoff = new Date(Date.now() - 72 * 60 * 60 * 1000); // 72 hours
+        const rejectedProducts = await this.prisma.product.findMany({
+            where: {
+                status: 'REJECTED',
+                updatedAt: { lt: cutoff },
+            },
+            include: { supplier: { select: { id: true, name: true } } },
+            take: 10,
+        });
+
+        for (const product of rejectedProducts) {
+            issues.push({
+                type: 'REJECTED_PRODUCT_STALE',
+                severity: 'LOW',
+                description: `Product "${product.name}" by ${product.supplier?.name} was rejected 72+ hours ago with no resubmission`,
+                entityId: product.id,
+                entityType: 'Product',
+                autoFixed: false,
+            });
+
+            if (SUPPLIER_PING_REJECTED_PRODUCT && product.supplierId && ALLOWED_ACTIONS.has('SEND_NOTIFICATION')) {
+                try {
+                    await this.notifications.create(
+                        product.supplierId,
+                        'Action Required: Product Needs Update',
+                        `Your product "${product.name}" was rejected. Please review the feedback and resubmit.`,
+                        'WARNING',
+                        { productId: product.id, link: '/supplier/products' },
+                    );
+                    issues[issues.length - 1].autoFixed = true;
+                    issues[issues.length - 1].fixDescription = 'Sent resubmission reminder to supplier';
+                    actions.push(`SEND_NOTIFICATION:product:${product.id}`);
+                } catch {}
+            }
+        }
+    }
+
+    private async checkLowStockProducts(issues: AgentIssue[], actions: string[]) {
+        const lowStock = await this.prisma.product.findMany({
+            where: {
+                status: 'APPROVED',
+                stock: { lte: 5, gt: 0 },
+            },
+            include: { supplier: { select: { id: true, name: true } } },
+            take: 10,
+        }).catch(() => []);
+
+        for (const product of lowStock) {
+            issues.push({
+                type: 'LOW_STOCK',
+                severity: 'LOW',
+                description: `Product "${product.name}" has only ${product.stock} units remaining`,
+                entityId: product.id,
+                entityType: 'Product',
+                autoFixed: false,
+            });
+
+            if (product.supplierId && ALLOWED_ACTIONS.has('SEND_NOTIFICATION')) {
+                try {
+                    await this.notifications.create(
+                        product.supplierId,
+                        'Low Stock Alert',
+                        `"${product.name}" has only ${product.stock} units left. Consider restocking soon.`,
+                        'WARNING',
+                        { productId: product.id },
+                    );
+                    issues[issues.length - 1].autoFixed = true;
+                    issues[issues.length - 1].fixDescription = 'Sent low-stock alert to supplier';
+                    actions.push(`SEND_NOTIFICATION:stock:${product.id}`);
+                } catch {}
+            }
+        }
+    }
+
+    private async generateAISummary(issues: AgentIssue[]): Promise<string> {
+        if (!process.env.OPENROUTER_API_KEY || issues.length === 0) {
+            return issues.length === 0
+                ? 'Marketplace scan complete. No issues detected. All systems operational.'
+                : `Scan found ${issues.length} issue(s): ${issues.filter(i => i.severity === 'CRITICAL').length} critical, ${issues.filter(i => i.severity === 'HIGH').length} high, ${issues.filter(i => i.severity === 'MEDIUM').length} medium, ${issues.filter(i => i.severity === 'LOW').length} low priority.`;
+        }
+
+        try {
+            const prompt = `You are a marketplace monitoring AI. Summarize these platform issues in 2-3 sentences for an admin dashboard. Be concise and actionable. Issues: ${JSON.stringify(issues.map(i => ({ type: i.type, severity: i.severity, desc: i.description, fixed: i.autoFixed })))}`;
+
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages: [{ role: 'user', content: prompt }],
+                    max_tokens: 150,
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 10000,
+                },
+            );
+            return response.data.choices[0].message.content.trim();
+        } catch {
+            const criticalCount = issues.filter(i => i.severity === 'CRITICAL').length;
+            const autoFixed = issues.filter(i => i.autoFixed).length;
+            return `Found ${issues.length} issue(s) — ${criticalCount} critical. Auto-resolved ${autoFixed} issue(s) via notifications. ${criticalCount > 0 ? 'Immediate admin action required.' : 'No immediate action needed.'}`;
+        }
+    }
+
+    async analyzeCustomerComplaint(complaint: string, userId: string): Promise<{ analysis: string; suggestedActions: string[] }> {
+        const userOrders = await this.prisma.order.findMany({
+            where: { customerId: userId },
+            orderBy: { createdAt: 'desc' },
+            take: 5,
+            select: { id: true, status: true, totalAmount: true, createdAt: true },
+        });
+
+        const context = `User has ${userOrders.length} recent orders. Latest: ${JSON.stringify(userOrders[0] || {})}`;
+
+        if (!process.env.OPENROUTER_API_KEY) {
+            return {
+                analysis: 'Your complaint has been recorded and will be reviewed by our support team.',
+                suggestedActions: ['Contact support via live chat', 'Check order status in dashboard'],
+            };
+        }
+
+        try {
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages: [
+                        {
+                            role: 'system',
+                            content: `You are an AI agent for Atlantis B2B Marketplace. A customer has a complaint. Analyze it and suggest 2-3 actionable steps. IMPORTANT: You CANNOT transfer money, change account roles, or delete data. Context about user: ${context}. Respond with JSON: { "analysis": "brief analysis", "suggestedActions": ["action1", "action2"] }`,
+                        },
+                        { role: 'user', content: complaint },
+                    ],
+                    max_tokens: 200,
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 10000,
+                },
+            );
+
+            const content = response.data.choices[0].message.content.trim();
+            try {
+                const jsonMatch = content.match(/\{[\s\S]*\}/);
+                if (jsonMatch) return JSON.parse(jsonMatch[0]);
+            } catch {}
+
+            return { analysis: content, suggestedActions: ['Contact support team for assistance'] };
+        } catch {
+            return {
+                analysis: 'Your complaint has been recorded. Our team will review it shortly.',
+                suggestedActions: ['Check your email for updates', 'Visit support chat for immediate help'],
+            };
+        }
+    }
+
+    async categorizeProduct(productName: string, description: string, categories: string[]): Promise<string | null> {
+        if (!process.env.OPENROUTER_API_KEY) return null;
+
+        try {
+            const prompt = `You are a product categorization expert. Given a product name and description, select the most appropriate category from the provided list. Return ONLY the category name exactly as it appears in the list. If no category matches, return "General".
+            
+Product Name: ${productName}
+Description: ${description}
+Categories List: ${categories.join(', ')}`;
+
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages: [{ role: 'user', content: prompt }],
+                    max_tokens: 50,
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 20000,
+                },
+            );
+
+            const result = response.data.choices[0].message.content.trim();
+            return categories.includes(result) ? result : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Full KYC vision check.
+     *
+     * Inputs (any combination — at minimum frontUrl):
+     *   - frontUrl       front of the ID
+     *   - backUrl        back of the ID (optional)
+     *   - selfieUrl      live selfie / video frame for face match
+     *   - declaredCountry the country the user said they're from
+     *                    (we'll cross-check against the document)
+     *   - declaredName   the name the user registered with (we'll
+     *                    sanity-check against the name on the doc)
+     *
+     * Output: a signals object covering every criterion the operator
+     * asked about — document genuineness, country detected,
+     * face-match between selfie and ID, name-match, plus an overall
+     * confidence the calling KYC service uses for auto-approval.
+     */
+    async verifyKYCDocument(
+        frontUrl: string,
+        backUrl?: string,
+        selfieUrl?: string,
+        declaredCountry?: string,
+        declaredName?: string,
+    ): Promise<{
+        approved: boolean;
+        reason: string;
+        confidence: number;
+        documentValid: boolean;
+        countryDetected?: string;
+        countryMatch?: boolean;
+        faceMatch?: boolean;
+        faceMatchConfidence?: number;
+        nameOnDocument?: string;
+        nameMatch?: boolean;
+        documentType?: string;
+        recommendation: 'AUTO_APPROVE' | 'AUTO_REJECT' | 'MANUAL_REVIEW';
+    }> {
+        const fail = (reason: string) => ({
+            approved: false,
+            reason,
+            confidence: 0,
+            documentValid: false,
+            recommendation: 'MANUAL_REVIEW' as const,
+        });
+
+        if (!process.env.OPENROUTER_API_KEY) {
+            return fail('AI Verification system offline (OPENROUTER_API_KEY missing)');
+        }
+
+        try {
+            const prompt = `You are an identity verification expert reviewing a KYC submission for a B2B wholesale marketplace.
+
+Inputs you have:
+- Image 1: FRONT of an identity document (national ID, passport, or driver's license).
+${backUrl ? '- Image 2: BACK of the same identity document.' : ''}
+${selfieUrl ? '- Image 3: A live SELFIE of the person submitting the document.' : ''}
+
+What the user told us at signup:
+- Declared name:    ${declaredName ? `"${declaredName}"` : '(not provided)'}
+- Declared country: ${declaredCountry ? `"${declaredCountry}"` : '(not provided)'}
+
+Carefully analyse and return a JSON object with EXACTLY these fields:
+
+{
+  "documentValid":        boolean,            // is this a real, untampered, legible ID document?
+  "documentType":         "PASSPORT" | "NATIONAL_ID" | "DRIVING_LICENSE" | "RESIDENCE_PERMIT" | "OTHER",
+  "countryDetected":      "<country name in English, e.g. Egypt, Romania>", // from the document itself
+  "countryMatch":         boolean,            // does countryDetected match the declared country?
+  "nameOnDocument":       "<full name as printed on document>",
+  "nameMatch":            boolean,            // does nameOnDocument match the declared name? Allow minor spelling diffs and ordering.
+  "faceMatch":            boolean,            // ${selfieUrl ? 'does the face in the selfie clearly match the face on the ID?' : 'false (no selfie provided)'}
+  "faceMatchConfidence":  number,             // 0.0–1.0; ${selfieUrl ? 'how confident are you the faces match?' : '0 if no selfie'}
+  "confidence":           number,             // 0.0–1.0 OVERALL confidence the submission is legitimate
+  "reason":               "<one-sentence summary of the strongest signals>",
+  "recommendation":       "AUTO_APPROVE" | "AUTO_REJECT" | "MANUAL_REVIEW"
+}
+
+Rules for "recommendation":
+- AUTO_APPROVE  only if documentValid AND faceMatch AND nameMatch AND countryMatch AND confidence >= 0.85.
+- AUTO_REJECT   if documentValid is false, OR faceMatch is clearly false (different person), OR document is obviously forged.
+- MANUAL_REVIEW for everything in between (poor lighting, partial obscuration, ambiguous match).
+
+Return ONLY the JSON. No markdown fences, no commentary.`;
+
+            const images: any[] = [
+                { type: 'image_url', image_url: { url: frontUrl } },
+            ];
+            if (backUrl)   images.push({ type: 'image_url', image_url: { url: backUrl } });
+            if (selfieUrl) images.push({ type: 'image_url', image_url: { url: selfieUrl } });
+
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages: [
+                        {
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: prompt },
+                                ...images,
+                            ],
+                        },
+                    ],
+                    max_tokens: 600,
+                    temperature: 0,
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 45000,
+                },
+            );
+
+            const content = String(response.data?.choices?.[0]?.message?.content ?? '').trim();
+            const cleaned = content.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+            const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+                return fail('AI returned an unparseable response');
+            }
+            const parsed = JSON.parse(jsonMatch[0]);
+
+            const recommendation: 'AUTO_APPROVE' | 'AUTO_REJECT' | 'MANUAL_REVIEW' =
+                parsed.recommendation === 'AUTO_APPROVE'  ? 'AUTO_APPROVE'  :
+                parsed.recommendation === 'AUTO_REJECT'   ? 'AUTO_REJECT'   :
+                'MANUAL_REVIEW';
+
+            return {
+                approved: recommendation === 'AUTO_APPROVE',
+                reason: parsed.reason || 'AI completed verification',
+                confidence: Number(parsed.confidence) || 0,
+                documentValid: !!parsed.documentValid,
+                countryDetected: parsed.countryDetected ?? undefined,
+                countryMatch: parsed.countryMatch ?? undefined,
+                faceMatch: parsed.faceMatch ?? undefined,
+                faceMatchConfidence: parsed.faceMatchConfidence != null ? Number(parsed.faceMatchConfidence) : undefined,
+                nameOnDocument: parsed.nameOnDocument ?? undefined,
+                nameMatch: parsed.nameMatch ?? undefined,
+                documentType: parsed.documentType ?? undefined,
+                recommendation,
+            };
+        } catch (error: any) {
+            this.logger.error(`KYC AI Verification ERROR: ${error?.message || error}`);
+            return fail(`Error during AI processing: ${error?.message || 'unknown'}`);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // PRICING ASSISTANT — answers customer questions about any product's pricing
+    // ──────────────────────────────────────────────────────────────────────────
+    async pricingAssistant(
+        productId: string,
+        message: string,
+        history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
+    ): Promise<{ reply: string; suggestedQuestions: string[] }> {
+        // 1. Fetch product
+        const product = await this.prisma.product.findUnique({
+            where: { id: productId },
+            select: {
+                name: true, brand: true, basePrice: true, price: true,
+                unit: true, unitsPerCase: true, casesPerPallet: true,
+                unitsPerPallet: true, palletsPerShipment: true,
+            },
+        });
+
+        if (!product) {
+            return { reply: 'Product not found.', suggestedQuestions: [] };
+        }
+
+        // 2. Fetch markups from AppConfig
+        const [pieceConf, palletConf, containerConf, legacyConf] = await Promise.all([
+            this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_PIECE' } }),
+            this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_PALLET' } }),
+            this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE_CONTAINER' } }),
+            this.prisma.appConfig.findUnique({ where: { key: 'MARKUP_PERCENTAGE' } }),
+        ]);
+
+        const mPiece     = pieceConf     ? parseFloat(pieceConf.value)     : (legacyConf ? parseFloat(legacyConf.value) : 1.10);
+        const mPallet    = palletConf    ? parseFloat(palletConf.value)    : 1.05;
+        const mContainer = containerConf ? parseFloat(containerConf.value) : 1.02;
+
+        // 3. Compute per-piece base (before markup)
+        const piecesPerCase   = product.unitsPerCase || 0;
+        const casesPerPallet  = product.casesPerPallet || 0;
+        const piecesPerPallet = product.unitsPerPallet || (piecesPerCase * casesPerPallet) || 0;
+        const palletsPerTruck = product.palletsPerShipment || 0;
+        const baseUnit        = String(product.unit || 'piece').toLowerCase();
+
+        const rawBase = product.basePrice != null ? product.basePrice : product.price / mPiece;
+        let basePerPiece = rawBase;
+        if ((baseUnit.includes('case') || baseUnit.includes('carton') || baseUnit.includes('box')) && piecesPerCase > 0)
+            basePerPiece = rawBase / piecesPerCase;
+        else if (baseUnit.includes('pallet') && piecesPerPallet > 0)
+            basePerPiece = rawBase / piecesPerPallet;
+        else if ((baseUnit.includes('truck') || baseUnit.includes('container') || baseUnit.includes('shipment')) && piecesPerPallet > 0 && palletsPerTruck > 0)
+            basePerPiece = rawBase / (piecesPerPallet * palletsPerTruck);
+
+        // 4. Compute tier prices
+        const fmt = (n: number) => `€${n.toFixed(3)}`;
+        const cartonTotal  = piecesPerCase > 0 ? basePerPiece * piecesPerCase * mPiece : null;
+        const palletTotal  = piecesPerPallet > 0 ? basePerPiece * piecesPerPallet * mPallet : null;
+        const truckTotal   = (piecesPerPallet > 0 && palletsPerTruck > 0) ? basePerPiece * piecesPerPallet * palletsPerTruck * mContainer : null;
+        const cartonsInPallet = casesPerPallet;
+        const cartonsInTruck  = casesPerPallet * palletsPerTruck;
+        const cartonPerCtn    = cartonTotal;
+        const palletPerCtn    = palletTotal && cartonsInPallet > 0 ? palletTotal / cartonsInPallet : null;
+        const truckPerCtn     = truckTotal  && cartonsInTruck  > 0 ? truckTotal  / cartonsInTruck  : null;
+
+        // Pre-compute the step-by-step calculation strings so the AI can quote them exactly
+        const bpp = basePerPiece.toFixed(4);
+        const cartonCalc  = cartonTotal  != null ? `${bpp} × ${piecesPerCase} pcs = ${(basePerPiece*piecesPerCase).toFixed(3)} × ${mPiece} markup = ${cartonTotal.toFixed(3)}€` : '';
+        const palletCalc  = palletTotal  != null ? `${bpp} × ${piecesPerCase} × ${casesPerPallet} ctns = ${(basePerPiece*piecesPerCase*casesPerPallet).toFixed(3)} × ${mPallet} markup = ${palletTotal.toFixed(3)}€` : '';
+        const truckCalc   = truckTotal   != null ? `${bpp} × ${piecesPerCase} × ${casesPerPallet} × ${palletsPerTruck} = ${(basePerPiece*piecesPerCase*casesPerPallet*palletsPerTruck).toFixed(3)} × ${mContainer} markup = ${truckTotal.toFixed(3)}€` : '';
+
+        // 5. Build system prompt
+        const systemPrompt = `You are Atlantis FMCG's smart B2B pricing assistant. Your job is to help buyers understand exact pricing using clear step-by-step calculations.
+
+PRODUCT: ${product.name}${product.brand ? ` by ${product.brand}` : ''}
+
+PACKAGING STRUCTURE:
+- Pieces per carton: ${piecesPerCase}
+- Cartons per pallet: ${casesPerPallet}
+- Pallets per truck/container: ${palletsPerTruck}
+- Total cartons per pallet: ${cartonsInPallet}
+- Total cartons per truck: ${cartonsInTruck}
+
+MARKUP RATES (from admin settings):
+- Carton markup: +${Math.round((mPiece-1)*100)}%  (multiplier: ×${mPiece})
+- Pallet markup: +${Math.round((mPallet-1)*100)}%  (multiplier: ×${mPallet})
+- Truck markup:  +${Math.round((mContainer-1)*100)}%  (multiplier: ×${mContainer})
+
+CALCULATED TIER PRICES (always quote these exact numbers):
+${cartonTotal  != null ? `🗃️ CARTON:  ${cartonCalc}
+   → Customer pays: €${cartonTotal.toFixed(2)} per carton  (= €${cartonPerCtn!.toFixed(3)} / ctn)` : ''}
+${palletTotal  != null ? `📦 PALLET:  ${palletCalc}
+   → Customer pays: €${palletTotal.toFixed(2)} per pallet  (= €${palletPerCtn!.toFixed(3)} / ctn | ${cartonsInPallet} cartons)` : ''}
+${truckTotal   != null ? `🚛 TRUCK:   ${truckCalc}
+   → Customer pays: €${truckTotal.toFixed(2)} per truck   (= €${truckPerCtn!.toFixed(3)} / ctn | ${cartonsInTruck} cartons)` : ''}
+
+SAVINGS (per carton):
+${palletPerCtn && cartonPerCtn ? `• Pallet vs Carton: saves €${(cartonPerCtn - palletPerCtn).toFixed(3)}/ctn = ${((1 - palletPerCtn/cartonPerCtn)*100).toFixed(1)}% cheaper` : ''}
+${truckPerCtn  && cartonPerCtn ? `• Truck vs Carton:  saves €${(cartonPerCtn - truckPerCtn).toFixed(3)}/ctn = ${((1 - truckPerCtn/cartonPerCtn)*100).toFixed(1)}% cheaper` : ''}
+
+CRITICAL RULES — follow these strictly:
+1. ALWAYS show the step-by-step calculation so the buyer can verify the math.
+   Format: "base × pieces × cartons × markup = total"
+2. When asked "how much for N pallets?", compute: N × €${palletTotal?.toFixed(2) ?? '?'} = total, then add "(= N×${cartonsInPallet} = X cartons total)"
+3. When asked "how much for N trucks?", compute: N × €${truckTotal?.toFixed(2) ?? '?'} = total
+4. Always show the per-carton equivalent (€/ctn) alongside the tier total.
+5. Respond in the SAME LANGUAGE as the buyer (Arabic → Arabic, English → English).
+6. Never mention internal base prices or margin details — only the customer-facing price.
+7. Be precise with decimal places — pricing matters in B2B.`;
+
+        if (!process.env.OPENROUTER_API_KEY) {
+            // Fallback: deterministic rule-based responses
+            const reply = this.buildFallbackPricingReply(message, { cartonTotal, palletTotal, truckTotal, cartonPerCtn, palletPerCtn, truckPerCtn, cartonsInPallet, cartonsInTruck, piecesPerCase });
+            return { reply, suggestedQuestions: this.getPricingSuggestions(cartonTotal, palletTotal, truckTotal) };
+        }
+
+        try {
+            const messages = [
+                { role: 'system' as const, content: systemPrompt },
+                ...history.slice(-6), // keep last 3 exchanges for context
+                { role: 'user' as const, content: message },
+            ];
+
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages,
+                    max_tokens: 400,
+                    temperature: 0.3,
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 15000,
+                },
+            );
+
+            const reply = response.data.choices[0].message.content.trim();
+            return {
+                reply,
+                suggestedQuestions: this.getPricingSuggestions(cartonTotal, palletTotal, truckTotal),
+            };
+        } catch (err) {
+            this.logger.warn(`Pricing assistant AI call failed: ${err?.message}`);
+            const reply = this.buildFallbackPricingReply(message, { cartonTotal, palletTotal, truckTotal, cartonPerCtn, palletPerCtn, truckPerCtn, cartonsInPallet, cartonsInTruck, piecesPerCase });
+            return { reply, suggestedQuestions: this.getPricingSuggestions(cartonTotal, palletTotal, truckTotal) };
+        }
+    }
+
+    private buildFallbackPricingReply(
+        message: string,
+        p: { cartonTotal: number|null; palletTotal: number|null; truckTotal: number|null; cartonPerCtn: number|null; palletPerCtn: number|null; truckPerCtn: number|null; cartonsInPallet: number; cartonsInTruck: number; piecesPerCase: number },
+    ): string {
+        const fmt = (n: number) => `€${n.toFixed(2)}`;
+        const msg = message.toLowerCase();
+        if ((msg.includes('truck') || msg.includes('شاحنة') || msg.includes('container')) && p.truckTotal) {
+            return `🚛 Truck price: ${fmt(p.truckTotal!)} total\n📦 Per carton: ${fmt(p.truckPerCtn!)} / ctn\n(${p.cartonsInTruck} cartons per truck)`;
+        }
+        if ((msg.includes('pallet') || msg.includes('باليت')) && p.palletTotal) {
+            return `📦 Pallet price: ${fmt(p.palletTotal!)} total\n📦 Per carton: ${fmt(p.palletPerCtn!)} / ctn\n(${p.cartonsInPallet} cartons per pallet)`;
+        }
+        if ((msg.includes('carton') || msg.includes('كرتون') || msg.includes('box')) && p.cartonTotal) {
+            return `🗃️ Carton price: ${fmt(p.cartonTotal!)} / carton\n(${p.piecesPerCase} pieces per carton)`;
+        }
+        // Default: show all tiers
+        const lines = ['Here is the full pricing summary:'];
+        if (p.cartonTotal)  lines.push(`🗃️ Carton: ${fmt(p.cartonTotal)} = ${fmt(p.cartonPerCtn!)} / ctn`);
+        if (p.palletTotal)  lines.push(`📦 Pallet: ${fmt(p.palletTotal)} = ${fmt(p.palletPerCtn!)} / ctn (${p.cartonsInPallet} ctns)`);
+        if (p.truckTotal)   lines.push(`🚛 Truck:  ${fmt(p.truckTotal)} = ${fmt(p.truckPerCtn!)} / ctn (${p.cartonsInTruck} ctns)`);
+        return lines.join('\n');
+    }
+
+    private getPricingSuggestions(cartonTotal: number|null, palletTotal: number|null, truckTotal: number|null): string[] {
+        const q: string[] = [];
+        if (cartonTotal)  q.push('What is the carton price?');
+        if (palletTotal)  q.push('What is the pallet price?');
+        if (truckTotal)   q.push('What is the truck price?');
+        if (palletTotal && cartonTotal) q.push('How much do I save buying a pallet?');
+        if (truckTotal  && cartonTotal) q.push('How much cheaper per carton on a truck?');
+        q.push('How many pieces per carton?');
+        return q.slice(0, 4);
+    }
+
+    getReports(): AgentReport[] {
+        return this.reports;
+    }
+
+    getLatestReport(): AgentReport | null {
+        return this.reports[0] ?? null;
+    }
+
+    /**
+     * Use an LLM to figure out which Excel column maps to which product
+     * field. Works regardless of column order, header position, language,
+     * or extra/unexpected columns. Falls back gracefully if the LLM is
+     * unavailable — caller should fall back to its own header heuristics.
+     *
+     * Inputs: a small sample of the sheet (first ~12 rows is enough).
+     * Output: { 0: 'name', 1: 'price', 2: null, ... } where null = ignore.
+     */
+    async detectColumnMapping(sampleRows: any[][]): Promise<{
+        mapping: Record<number, string | null>;
+        headerRowIndex: number;
+        confidence: 'high' | 'medium' | 'low';
+        reasoning?: string;
+    } | null> {
+        if (!process.env.OPENROUTER_API_KEY) return null;
+        if (!sampleRows || sampleRows.length === 0) return null;
+
+        // Trim to at most 12 rows × 20 cols so we don't blow the prompt budget
+        const trimmed = sampleRows.slice(0, 12).map(r => (r || []).slice(0, 20));
+        const sheetText = trimmed
+            .map((r, i) => `Row ${i}: ${JSON.stringify(r)}`)
+            .join('\n');
+
+        const allowedFields = [
+            'name', 'description', 'brand', 'category', 'ean',
+            'price', 'stock', 'unit',
+            'unitsPerCase', 'casesPerPallet', 'unitsPerPallet', 'palletsPerShipment',
+            'shelfLife', 'origin', 'weight', 'moq',
+        ];
+
+        const prompt = `You are a smart spreadsheet analyst for a B2B wholesale marketplace. Given a sample of an Excel sheet (first 12 rows), figure out:
+1. Which row is the header (might not be row 0 — could be row 1, 2, etc., depending on title rows / merged cells / sub-headers).
+2. Which product field each column corresponds to. Use BOTH the header text AND the actual data values to decide.
+3. If a column has no clear meaning, set it to null.
+
+Allowed field names (use ONLY these, anything else is invalid):
+${allowedFields.join(', ')}
+
+⚠️ CRITICAL — PRICE DETECTION (most common mistake — read carefully):
+The "price" column is the column whose data CELLS contain a CURRENCY SYMBOL
+(€, $, £, ¥, EUR, USD, GBP) — e.g. " € 1.99 ", "€0.38", "$5.45", "1,58 €",
+"EUR 2.50". This is the ONLY reliable signal. Do NOT pick a column just
+because its header says "price" or because its values are decimals — many
+columns have decimal values (e.g. "Available physical in PALLETS" might
+contain values like 0.06, 2.62 — these are NOT prices, they are pallet
+counts). If MORE than one column looks like price, pick the one with
+currency symbols. If NO column has currency symbols, fall back to the
+column whose header literally contains the word "price" / "cost" / "سعر".
+
+Other rules:
+- "ean" is the SKU / Item number / barcode (long numeric or alphanumeric ID).
+- "stock" is the available quantity in CASES or pieces (integer, usually
+  2-4 digits like 48, 1054, 96). NOT the pallet float (0.06, 2.62).
+- "unitsPerCase" is pieces per case/carton (e.g. value "C24" = 24).
+- "casesPerPallet" is how many cases stack on a pallet (integer like 48, 256, 403).
+- For columns headed "Available physical in PALLETS" or "Available in pallets"
+  (values like 0.06, 2.62, 1.00) — set to null. These are stock-in-pallets,
+  NOT price and NOT a conversion factor.
+- "unitsPerPallet" should be left null if the column is "available physical in pallets".
+- "shelfLife" is for batch number / expiry date columns.
+- "moq" is the minimum order quantity column. Its header may be labeled "MOQ", "MQQ", "Min Order", "Minimum Order Quantity", "Minimum Quantity", or similar.
+- "name" is the human-readable product name (text WITH letters — e.g. "KitKat Mini 200g").
+  ⚠️ Must NEVER pick a column whose header is "Item NUMBER" or "Item NO" — that's the EAN/SKU.
+  The name column header is "Item NAME" / "Product NAME" / "Description" / "اسم المنتج".
+- A long 8-13 digit number that's not a date is likely an EAN.
+- A YYYYMMDD-style number (e.g. 20260731) is a date → shelfLife.
+
+Respond ONLY with valid JSON of this exact shape:
+{
+  "headerRowIndex": <integer>,
+  "mapping": { "0": "name" | null, "1": "price" | null, ... },
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "<one sentence>"
+}
+
+Sheet sample:
+${sheetText}`;
+
+        try {
+            const response = await axios.post(
+                this.openRouterUrl,
+                {
+                    model: 'google/gemini-2.0-flash-exp:free',
+                    messages: [{ role: 'user', content: prompt }],
+                    max_tokens: 800,
+                    temperature: 0.1,
+                    response_format: { type: 'json_object' },
+                },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                    },
+                    timeout: 25000,
+                },
+            );
+
+            const raw = response.data?.choices?.[0]?.message?.content;
+            if (!raw) return null;
+
+            // The model sometimes wraps JSON in ```json ... ``` — strip it
+            const cleaned = String(raw).replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+            const parsed = JSON.parse(cleaned);
+
+            if (typeof parsed.headerRowIndex !== 'number') return null;
+            if (!parsed.mapping || typeof parsed.mapping !== 'object') return null;
+
+            // Convert string keys → number, validate field names against allowlist
+            const mapping: Record<number, string | null> = {};
+            for (const [k, v] of Object.entries(parsed.mapping)) {
+                const colIdx = Number(k);
+                if (Number.isNaN(colIdx)) continue;
+                if (v === null || v === undefined || v === '') {
+                    mapping[colIdx] = null;
+                } else if (allowedFields.includes(String(v))) {
+                    mapping[colIdx] = String(v);
+                } else {
+                    mapping[colIdx] = null;
+                }
+            }
+
+            this.logger.log(`[AI ColumnMapper] header=${parsed.headerRowIndex} confidence=${parsed.confidence} mapping=${JSON.stringify(mapping)}`);
+
+            return {
+                mapping,
+                headerRowIndex: parsed.headerRowIndex,
+                confidence: ['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'medium',
+                reasoning: parsed.reasoning,
+            };
+        } catch (e: any) {
+            this.logger.warn(`[AI ColumnMapper] failed: ${e?.message}`);
+            return null;
+        }
+    }
+}

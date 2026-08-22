@@ -1,0 +1,1113 @@
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { OrderStatus } from '@prisma/client';
+import { PrismaService } from '../common/prisma.service';
+import { EmailService } from '../email/email.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { InvoiceService } from '../invoices/invoice.service';
+import { EscrowService } from '../payments/escrow.service';
+import { AppConfigService } from '../admin/app-config.service';
+
+const STATUS_LABELS: Record<OrderStatus, string> = {
+    PENDING: 'Pending',
+    PAID: 'Paid',
+    PROCESSING: 'Processing',
+    SHIPPED: 'Shipped',
+    DELIVERED: 'Delivered',
+    CANCELLED: 'Cancelled',
+};
+
+@Injectable()
+export class OrdersService {
+    constructor(
+        private prisma: PrismaService,
+        private emailService: EmailService,
+        private notificationsService: NotificationsService,
+        private invoiceService: InvoiceService,
+        private escrowService: EscrowService,
+        private appConfigService: AppConfigService,
+    ) { }
+
+    /**
+     * Admin / logistics assigns a transport carrier, price, and (optionally)
+     * the carrier-issued tracking number to the order. Upsert pattern so the
+     * admin can update fields independently as info comes in: carrier first
+     * during the booking call, tracking number when the carrier returns it,
+     * price when negotiated.
+     *
+     * Order.shippingCompany + Order.shippingCost are stored on the Order
+     * row directly. trackingNumber + carrier live on a separate Shipment
+     * row (one-to-one with Order via unique orderId) so the Shipment record
+     * can carry status updates over time.
+     */
+    async setShipping(
+        orderId: string,
+        shippingCompany?: string | null,
+        shippingCost?: number | null,
+        trackingNumber?: string | null,
+    ) {
+        // 1. Order-level fields
+        const orderData: any = {};
+        if (shippingCompany !== undefined) orderData.shippingCompany = shippingCompany || null;
+        if (shippingCost !== undefined) {
+            orderData.shippingCost = shippingCost === null ? null
+                : Number(shippingCost) >= 0 ? Number(shippingCost) : null;
+        }
+        if (Object.keys(orderData).length > 0) {
+            await this.prisma.order.update({ where: { id: orderId }, data: orderData });
+        }
+
+        // 2. Shipment-level fields (tracking + carrier)
+        if (trackingNumber !== undefined || shippingCompany !== undefined) {
+            const trimmedTracking = trackingNumber?.trim();
+            if (trimmedTracking) {
+                // Upsert the Shipment row. trackingNumber is @unique in the
+                // schema; if a customer's old tracking number is being
+                // reassigned to a different order Prisma will throw — that
+                // shouldn't happen in normal use because each carrier-issued
+                // tracking is unique to the shipment.
+                await this.prisma.shipment.upsert({
+                    where: { orderId },
+                    create: {
+                        orderId,
+                        trackingNumber: trimmedTracking,
+                        carrier: shippingCompany || null,
+                    },
+                    update: {
+                        trackingNumber: trimmedTracking,
+                        ...(shippingCompany !== undefined ? { carrier: shippingCompany || null } : {}),
+                    },
+                });
+            } else if (trackingNumber === null) {
+                // Explicit clear — drop the Shipment row entirely.
+                await this.prisma.shipment.deleteMany({ where: { orderId } });
+            } else if (shippingCompany !== undefined) {
+                // Only the carrier was changed — update existing Shipment if any.
+                await this.prisma.shipment.updateMany({
+                    where: { orderId },
+                    data: { carrier: shippingCompany || null },
+                });
+            }
+        }
+
+        // Return the merged latest state
+        const fresh = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            select: {
+                id: true,
+                shippingCompany: true,
+                shippingCost: true,
+                shipment: { select: { trackingNumber: true, carrier: true } },
+            },
+        });
+        return {
+            id: fresh?.id,
+            shippingCompany: fresh?.shippingCompany,
+            shippingCost: fresh?.shippingCost,
+            trackingNumber: (fresh as any)?.shipment?.trackingNumber ?? null,
+        };
+    }
+
+    async create(customerId: string, totalAmount: number, items: any[], shippingCompany?: string, shippingCost?: number) {
+        // Snapshot product names so the order keeps history if a product
+        // is deleted later. We pass `name` from the cart payload when
+        // available, otherwise look it up.
+        const productIds = items.map(i => i.productId).filter(Boolean);
+        const productRows = productIds.length > 0
+            ? await this.prisma.product.findMany({
+                where: { id: { in: productIds } },
+                select: { id: true, name: true, stock: true },
+            })
+            : [];
+        const nameById = new Map(productRows.map(p => [p.id, p.name]));
+        const stockById = new Map(productRows.map(p => [p.id, p.stock]));
+
+        // ── Stock reservation gate ───────────────────────────────
+        // Operator rule: every order line decrements the product's
+        // stock by the ordered quantity. Reject the order outright
+        // if any line would push stock negative — this prevents
+        // overselling on a race between two simultaneous customers.
+        // The decrement happens inside a transaction below alongside
+        // the order create so a failed write rolls everything back.
+        const insufficient: string[] = [];
+        for (const item of items) {
+            if (!item.productId) continue;
+            const have = stockById.get(item.productId) ?? 0;
+            const want = Number(item.quantity || 0);
+            if (want > have) {
+                insufficient.push(`${nameById.get(item.productId) || item.productId} (have ${have}, want ${want})`);
+            }
+        }
+        if (insufficient.length > 0) {
+            throw new BadRequestException(
+                `Not enough stock for: ${insufficient.join('; ')}. Reduce the quantity or contact the supplier.`,
+            );
+        }
+
+        const order = await this.prisma.order.create({
+            data: {
+                customerId,
+                totalAmount,
+                shippingCompany: shippingCompany ?? null,
+                // Snapshot the buyer's chosen carrier so the admin order
+                // detail can always surface "this is what the customer
+                // picked at checkout", even after operations re-routes
+                // the shipment via /admin/orders/[id] later.
+                customerShippingCompany: shippingCompany ?? null,
+                shippingCost: shippingCost ?? null,
+                status: OrderStatus.PENDING,
+                items: {
+                    create: items.map(item => ({
+                        productId: item.productId,
+                        quantity: item.quantity,
+                        price: item.price,
+                        productNameSnapshot: item.name || nameById.get(item.productId) || null,
+                        selectedVariants:
+                            item.selectedVariants && typeof item.selectedVariants === 'object'
+                                ? item.selectedVariants
+                                : undefined,
+                        selectedTier: item.tier || null,
+                        // Mixed-tier composition — when the buyer used the
+                        // mix composer at checkout, this carries the
+                        // per-variant breakdown so the admin order detail
+                        // can render the exact split. Validated upstream
+                        // (sum of qty = item.quantity = tier capacity).
+                        mixComposition:
+                            Array.isArray(item.mixComposition) && item.mixComposition.length > 0
+                                ? item.mixComposition
+                                : undefined,
+                    })),
+                },
+                history: {
+                    create: {
+                        newStatus: OrderStatus.PENDING,
+                        changedById: customerId,
+                        reason: 'Order created',
+                    },
+                },
+            },
+            include: {
+                items: true,
+                history: true,
+                customer: { select: { email: true, name: true } },
+            },
+        });
+
+        // ── Decrement stock for every line ───────────────────────
+        // Done AFTER the order row is committed so there's a single
+        // source of truth (the order id) tying each decrement back.
+        // We checked sufficiency above; here we just fire the
+        // decrements in parallel. If one fails the order still
+        // exists but the stock count will be off — the reconcile
+        // job (admin → inventory tools) catches drift.
+        await Promise.all(
+            items
+                .filter((i) => i.productId)
+                .map((i) =>
+                    this.prisma.product
+                        .update({
+                            where: { id: i.productId },
+                            data: { stock: { decrement: Number(i.quantity || 0) } },
+                        })
+                        .catch((err) =>
+                            console.error(
+                                `[STOCK_DECREMENT_FAIL] order=${order.id} product=${i.productId}: ${err?.message}`,
+                            ),
+                        ),
+                ),
+        );
+
+        // Send Customer Confirmation Email (payment bypassed as per client request)
+        if (order.customer?.email) {
+            this.emailService.sendOrderConfirmationEmail(
+                order.customer.email,
+                order.customer.name,
+                order.id,
+                order.totalAmount
+            ).catch(err => console.error('Failed to send order confirmation email:', err));
+        }
+
+        // Notify each supplier
+        const supplierIds = [...new Set(
+            order.items
+                .map((item: any) => item.product?.supplierId)
+                .filter(Boolean)
+        )];
+        for (const supplierId of supplierIds) {
+            this.notificationsService.create(
+                supplierId as string,
+                'New Order Received',
+                `You have a new order #${order.id.slice(-8).toUpperCase()} waiting for confirmation.`,
+                'INFO',
+                { orderId: order.id },
+            ).catch(() => {});
+        }
+
+        // Notify Admins & Owners
+        this.notificationsService.notifyAdmins(
+            'New Order Received',
+            `Order #${order.id.slice(-8).toUpperCase()} has been placed by ${order.customer?.name}.`,
+            'INFO',
+            { orderId: order.id }
+        ).catch(() => {});
+
+        return order;
+    }
+
+    /**
+     * Logistics dashboard query: pull every order whose shippingCompany
+     * field matches the logged-in user's companyName / name (case-
+     * insensitive). The match is fuzzy because admin-typed carrier
+     * names ("DHL", "DHL Express", "DHL EU") all describe the same
+     * carrier — substring contains-either-direction is good enough
+     * without a hard FK between Users(LOGISTICS) and Orders.
+     */
+    async findOrdersForLogisticsUser(userId: string) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId },
+            select: { id: true, name: true, companyName: true, role: true },
+        });
+        if (!user) return [];
+
+        const candidates = [user.companyName, user.name]
+            .filter(Boolean)
+            .map(s => String(s).trim())
+            .filter(s => s.length > 0);
+
+        // Pull every order with a shippingCompany set, then filter in JS so
+        // we can do a fuzzy two-way contains match without bending Prisma.
+        const orders = await this.prisma.order.findMany({
+            where: { shippingCompany: { not: null } },
+            include: {
+                customer: { select: { id: true, name: true, email: true, phone: true } },
+                items: {
+                    include: {
+                        product: { select: { id: true, name: true, images: true, weight: true } },
+                    },
+                },
+                shipment: true,
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 500,
+        });
+
+        if (candidates.length === 0) return [];
+        const lc = candidates.map(c => c.toLowerCase());
+        return orders.filter(o => {
+            const ship = (o.shippingCompany || '').toLowerCase().trim();
+            if (!ship) return false;
+            return lc.some(c => ship.includes(c) || c.includes(ship));
+        });
+    }
+
+    async findAll() {
+        const orders = await this.prisma.order.findMany({
+            include: {
+                customer: {
+                    select: { id: true, name: true, email: true, phone: true }
+                },
+                supplier: {
+                    select: { id: true, name: true, email: true }
+                },
+                items: {
+                    include: {
+                        product: {
+                            include: {
+                                supplier: {
+                                    select: { id: true, name: true, email: true }
+                                }
+                            }
+                        }
+                    }
+                },
+                history: true,
+                shipment: true,
+            },
+        });
+
+        // Hoist platform fee fetch outside the loop (was awaiting inside .map)
+        const markupData = await this.appConfigService.getMarkupPercentage();
+        const feePercent = markupData.platformFee;
+
+        // Map to format suitable for Admin Dashboard
+        return orders.map(order => {
+            const customerId = order.customer?.id;
+            const customerName = order.customer?.name ?? 'Unknown Buyer';
+
+            // Collect unique supplier names from order items, excluding the buyer themselves
+            const supplierNamesFromItems: string[] = [];
+            const supplierIdsFromItems = new Set<string>();
+            for (const item of order.items) {
+                const sup = item.product?.supplier;
+                if (!sup) continue;
+                if (sup.id === customerId) continue; // buyer bought their own product (test data)
+                if (supplierIdsFromItems.has(sup.id)) continue;
+                supplierIdsFromItems.add(sup.id);
+                supplierNamesFromItems.push(sup.name);
+            }
+
+            // Prefer the order-level supplierId relation only if it differs from the buyer
+            let supplierNames: string;
+            if (order.supplier && order.supplier.id !== customerId) {
+                supplierNames = order.supplier.name;
+            } else if (supplierNamesFromItems.length > 0) {
+                supplierNames = supplierNamesFromItems.join(', ');
+            } else {
+                supplierNames = 'Platform Inventory';
+            }
+
+            let supplierProfit = 0;
+            for (const item of order.items) {
+                supplierProfit += item.price * item.quantity;
+            }
+            const adminProfit = order.totalAmount * (feePercent / 100);
+
+            return {
+                id: order.id,
+                customer: customerName,
+                customerId: order.customer?.id,
+                customerEmail: order.customer?.email,
+                customerPhone: order.customer?.phone,
+                supplier: supplierNames,
+                total: order.totalAmount,
+                supplierProfit,
+                adminProfit,
+                status: order.status,
+                date: order.createdAt.toISOString().split('T')[0],
+                shippingCompany: order.shippingCompany,
+                shippingCost: order.shippingCost,
+                trackingNumber: order.shipment?.trackingNumber,
+                carrier: order.shipment?.carrier,
+                items: order.items.map(i => ({
+                    product: i.product?.name ?? 'Unknown Product',
+                    quantity: i.quantity,
+                    price: i.price,
+                })),
+                history: order.history.map(h => ({
+                    status: h.newStatus,
+                    time: h.createdAt,
+                    reason: h.reason
+                }))
+            };
+        });
+    }
+
+    async findByBuyer(customerId: string, page = 1, limit = 20) {
+        const skip = (page - 1) * limit;
+        const [orders, total] = await Promise.all([
+            this.prisma.order.findMany({
+                where: { customerId, deletedByCustomer: false },
+                include: {
+                    items: {
+                        include: {
+                            product: { select: { id: true, name: true, images: true } },
+                        },
+                    },
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: limit,
+            }),
+            this.prisma.order.count({ where: { customerId } }),
+        ]);
+        return { data: orders, total, page, limit, totalPages: Math.ceil(total / limit) };
+    }
+
+    async findByIdForBuyer(orderId: string, customerId: string) {
+        const order = await this.prisma.order.findFirst({
+            where: { id: orderId, customerId },
+            include: {
+                customer: {
+                    select: {
+                        id: true, name: true, email: true, phone: true,
+                        companyName: true, country: true, vatNumber: true,
+                    },
+                },
+                items: {
+                    include: {
+                        product: {
+                            select: {
+                                id: true, name: true, images: true, brand: true,
+                                category: true, unit: true, ean: true,
+                                unitsPerCase: true, casesPerPallet: true,
+                                unitsPerPallet: true, palletsPerShipment: true,
+                                shelfLife: true,
+                                supplier: { select: { name: true } },
+                            },
+                        },
+                    },
+                },
+                history: { orderBy: { createdAt: 'asc' } },
+                shipment: {
+                    select: {
+                        trackingNumber: true, carrier: true, status: true,
+                        expectedDelivery: true,
+                    },
+                },
+            },
+        });
+        if (!order) throw new NotFoundException('Order not found');
+
+        // Flatten shipment fields into the response so the existing
+        // `order.trackingNumber` / `order.carrier` UI keeps working.
+        return {
+            ...order,
+            trackingNumber: order.shipment?.trackingNumber ?? null,
+            carrier: order.shipment?.carrier ?? null,
+            expectedDelivery: order.shipment?.expectedDelivery ?? null,
+        };
+    }
+
+    async findBySupplier(supplierId: string) {
+        const orders = await this.prisma.order.findMany({
+            where: {
+                items: { some: { product: { supplierId } } },
+            },
+            include: {
+                customer: { select: { id: true, name: true, email: true } },
+                items: {
+                    where: { product: { supplierId } },
+                    include: { product: { select: { id: true, name: true, images: true, supplierId: true } } },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        return orders.map(order => {
+            // Privacy mask: suppliers should NOT see the customer's
+            // real name or full email. Atlantis is the principal in
+            // the transaction; the supplier ships to the warehouse
+            // address, not the customer. We surface a redacted form
+            // so the supplier can still differentiate orders in the
+            // table ("Customer A" vs "Customer B") without learning
+            // who they are.
+            const masked = (raw?: string) =>
+                raw ? raw.split(' ').map((p) => (p ? p[0] + '***' : '')).join(' ') : 'Customer';
+            const maskedEmail = (raw?: string) =>
+                raw ? raw.replace(/^(.{2}).*@/, '$1***@') : '';
+            return {
+            id: order.id,
+            status: order.status,
+            totalAmount: order.totalAmount,
+            shippingCompany: order.shippingCompany,
+            createdAt: order.createdAt,
+            // The supplier UI reads `buyer` — keep this as the canonical
+            // shape. We also include `customer` as a back-compat alias
+            // in case any older client still expects it.
+            buyer: {
+                name: masked(order.customer?.name),
+                email: maskedEmail(order.customer?.email),
+            },
+            customer: {
+                name: masked(order.customer?.name),
+                email: maskedEmail(order.customer?.email),
+            },
+            items: order.items.map(item => ({
+                id: item.id,
+                productId: item.productId,
+                // Fall back to the snapshot when product was deleted post-order.
+                name: (item as any).product?.name ?? (item as any).productNameSnapshot ?? 'Deleted product',
+                image: (item as any).product?.images?.[0] ?? null,
+                quantity: item.quantity,
+                price: item.price,
+                // Forward the Shopify-style tier + variant snapshot so the
+                // supplier order page can render "10 × Pallet" next to qty
+                // (operator-requested) and the chosen variants for buyers
+                // who configured the product.
+                selectedTier: (item as any).selectedTier ?? null,
+                selectedVariants: (item as any).selectedVariants ?? null,
+                // Forward the mix breakdown so the supplier sees exactly
+                // which variants the customer bundled into the mixed
+                // truck/pallet (operator-required so they can pack
+                // 5 × Diet + 3 × Red etc.).
+                mixComposition: (item as any).mixComposition ?? null,
+            })),
+            };
+        });
+    }
+
+    // ─── Admin Stats ─────────────────────────────────────────────────
+    async countPending(): Promise<number> {
+        return this.prisma.order.count({
+            where: { status: OrderStatus.PENDING },
+        });
+    }
+
+    async getOrderStats() {
+        const [pending, processing, shipped, delivered, cancelled, total] = await Promise.all([
+            this.prisma.order.count({ where: { status: OrderStatus.PENDING } }),
+            this.prisma.order.count({ where: { status: OrderStatus.PROCESSING } }),
+            this.prisma.order.count({ where: { status: OrderStatus.SHIPPED } }),
+            this.prisma.order.count({ where: { status: OrderStatus.DELIVERED } }),
+            this.prisma.order.count({ where: { status: OrderStatus.CANCELLED } }),
+            this.prisma.order.count(),
+        ]);
+
+        // Total revenue in EGP (all non-cancelled orders)
+        const revenueResult = await this.prisma.order.aggregate({
+            where: { status: { not: OrderStatus.CANCELLED } },
+            _sum: { totalAmount: true },
+        });
+
+        return {
+            pending,
+            processing,
+            shipped,
+            delivered,
+            cancelled,
+            total,
+            totalRevenue: revenueResult._sum.totalAmount || 0,
+        };
+    }
+
+    // ─── Update Status ───────────────────────────────────────────────
+    async updateStatus(orderId: string, status: OrderStatus, changedById: string, reason?: string) {
+        return this.internalUpdateStatus(orderId, status, changedById, reason);
+    }
+
+    async bulkUpdateStatus(orderIds: string[], status: OrderStatus, changedById: string) {
+        const results = [];
+        for (const orderId of orderIds) {
+            try {
+                const updated = await this.internalUpdateStatus(orderId, status, changedById, `Bulk update to ${status}`);
+                results.push({ orderId, success: true });
+            } catch (err: any) {
+                results.push({ orderId, success: false, error: err.message });
+            }
+        }
+        return results;
+    }
+
+    private async internalUpdateStatus(orderId: string, status: OrderStatus, changedById: string, reason?: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            include: {
+                customer: { select: { email: true, name: true } },
+                items: {
+                    include: {
+                        product: {
+                            include: {
+                                supplier: { select: { id: true, name: true, email: true } }
+                            }
+                        }
+                    }
+                },
+            },
+        });
+
+        if (!order) throw new NotFoundException(`Order ${orderId} not found`);
+
+        const previousStatus = order.status;
+
+        // ── Stock restoration on cancel ───────────────────────────
+        // Operator rule: cancelling an order returns the reserved
+        // stock to the supplier. We only fire the increment on the
+        // transition INTO CANCELLED (not on every save while
+        // already cancelled). Refund flow doesn't touch stock here
+        // because the payments / dispute pipeline already handles
+        // it through escrow events — adding a second increment
+        // would double-credit.
+        if (status === 'CANCELLED' && previousStatus !== 'CANCELLED') {
+            await Promise.all(
+                order.items
+                    .filter((it) => it.productId)
+                    .map((it) =>
+                        this.prisma.product
+                            .update({
+                                where: { id: it.productId! },
+                                data: { stock: { increment: it.quantity } },
+                            })
+                            .catch((err) =>
+                                console.error(
+                                    `[STOCK_RESTORE_FAIL] order=${orderId} product=${it.productId}: ${err?.message}`,
+                                ),
+                            ),
+                    ),
+            );
+        }
+
+        // Update order status + create history entry
+        const updated = await this.prisma.order.update({
+            where: { id: orderId },
+            data: {
+                status,
+                history: {
+                    create: {
+                        previousStatus,
+                        newStatus: status,
+                        changedById,
+                        reason: reason || `Status changed to ${STATUS_LABELS[status] || status}`,
+                    },
+                },
+            },
+            include: {
+                items: true,
+                history: true,
+                customer: { select: { email: true, name: true } },
+            },
+        });
+
+        // Fetch shipment info if it exists for tracking
+        const shipment = await this.prisma.shipment.findUnique({
+            where: { orderId }
+        });
+
+        // Send email notification to customer
+        try {
+            const statusLabel = STATUS_LABELS[status] || status;
+            
+            // Build tracking URL if possible (Generic example, would ideally use carrier-specific logic)
+            let trackingUrl: string | undefined = undefined;
+            if (shipment && shipment.trackingNumber) {
+                if (shipment.carrier?.toUpperCase() === 'DHL') {
+                    trackingUrl = `https://www.dhl.com/en/express/tracking.html?AWB=${shipment.trackingNumber}`;
+                } else if (shipment.carrier?.toUpperCase() === 'FEDEX') {
+                    trackingUrl = `https://www.fedex.com/apps/fedextrack/?tracknumbers=${shipment.trackingNumber}`;
+                } else {
+                    // Fallback to internal tracking or generic link
+                    trackingUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/dashboard/customer/orders/${orderId}`;
+                }
+            }
+
+            await this.emailService.sendOrderStatusUpdateEmail(
+                order.customer.email,
+                order.customer.name,
+                orderId,
+                status,
+                trackingUrl
+            );
+
+            // Special follow-up for DELIVERED status
+            if (status === OrderStatus.DELIVERED) {
+                await this.emailService.sendFeedbackPromptEmail(
+                    order.customer.email,
+                    order.customer.name,
+                    orderId
+                );
+            }
+
+        } catch (e) {
+            console.error(`[ORDER_EMAIL_FAIL] ${orderId}:`, e);
+        }
+
+        // Notify each supplier involved
+        const supplierIds = [...new Set(
+            order.items.map((item: any) => item.product?.supplier?.id).filter(Boolean)
+        )];
+        for (const supplierId of supplierIds) {
+            // Skip notifying the supplier who just acted — they triggered
+            // the change themselves, no need to ping their own bell.
+            if (supplierId === changedById) continue;
+            this.notificationsService.create(
+                supplierId as string,
+                `Order ${STATUS_LABELS[status] || status}`,
+                `Order #${orderId.slice(-8).toUpperCase()} has been updated to ${STATUS_LABELS[status] || status}.`,
+                'INFO',
+                { orderId },
+            ).catch(() => {});
+        }
+
+        // Notify admin team when a SUPPLIER performs the change — so the
+        // operator's "supplier confirmed the order" complaint surfaces on
+        // the admin orders page + notification bell instead of being a
+        // silent state update. We check if the actor is a supplier (i.e.
+        // they appear in this order's supplierIds) before pinging admins.
+        const actorIsSupplier = supplierIds.includes(changedById);
+        if (actorIsSupplier) {
+            const actor = await this.prisma.user.findUnique({
+                where: { id: changedById },
+                select: { name: true, companyName: true },
+            }).catch(() => null);
+            const actorLabel = actor?.companyName || actor?.name || 'Supplier';
+            const verb =
+                status === 'PROCESSING' ? 'confirmed'
+                : status === 'SHIPPED'    ? 'shipped'
+                : status === 'CANCELLED'  ? 'cancelled'
+                : 'updated';
+            await this.notificationsService.notifyAdmins(
+                `${actorLabel} ${verb} order #${orderId.slice(-8).toUpperCase()}`,
+                `${actorLabel} marked order #${orderId.slice(-8).toUpperCase()} as ${STATUS_LABELS[status] || status}.`,
+                'INFO',
+                { orderId, supplierId: changedById, newStatus: status },
+            ).catch(() => { });
+        }
+
+        // Handle invoice generation on delivery
+        if (status === OrderStatus.DELIVERED) {
+            try {
+                await this.invoiceService.createInvoiceForOrder(orderId);
+            } catch (e) {
+                console.error(`[ORDER_INVOICE_FAIL] ${orderId}:`, e);
+            }
+        }
+
+        // Handle Escrow Void/Refund on Cancellation
+        if (status === OrderStatus.CANCELLED) {
+            try {
+                const escrow = await this.prisma.escrowTransaction.findUnique({ where: { orderId } });
+                if (escrow) {
+                    if (escrow.status === 'HOLDING') {
+                        await this.escrowService.voidEscrow(orderId, reason || 'Order cancelled by admin/supplier');
+                    } else if (escrow.status === 'RELEASED' || escrow.status === 'CAPTURED') {
+                        await this.escrowService.refundEscrow(orderId, reason || 'Order cancelled/refunded');
+                    }
+                }
+            } catch (err: any) {
+                console.error(`[ORDER_CANCEL_ESCROW_ERROR] Failed for ${orderId}:`, err.message);
+            }
+        }
+
+        return updated;
+    }
+
+
+    // ─── Supplier Analytics ───────────────────────────────────────────
+
+    async getSupplierAnalytics(supplierId: string, days: number) {
+        const since = new Date(Date.now() - days * 86_400_000);
+
+        // All orders that contain at least one product owned by this supplier
+        const orders = await this.prisma.order.findMany({
+            where: {
+                createdAt: { gte: since },
+                items: { some: { product: { supplierId } } },
+            },
+            include: {
+                items: {
+                    where: { product: { supplierId } },
+                    include: { product: { select: { id: true, name: true, basePrice: true, category: true } } },
+                },
+            },
+        });
+
+        // Revenue = sum of item.price * item.quantity (customer-facing prices)
+        let totalRevenue = 0;
+        let totalItems = 0;
+        const productMap: Record<string, { name: string; orders: number; revenue: number; category: string }> = {};
+        const categoryMap: Record<string, number> = {};
+
+        for (const order of orders) {
+            if (order.status === 'CANCELLED') continue;
+            for (const item of order.items) {
+                const lineTotal = item.price * item.quantity;
+                totalRevenue += lineTotal;
+                totalItems += item.quantity;
+                const pid = item.product?.id ?? 'unknown';
+                const pname = item.product?.name ?? 'Unknown';
+                const cat = item.product?.category ?? 'Other';
+                if (!productMap[pid]) productMap[pid] = { name: pname, orders: 0, revenue: 0, category: cat };
+                productMap[pid].orders += item.quantity;
+                productMap[pid].revenue += lineTotal;
+                categoryMap[cat] = (categoryMap[cat] ?? 0) + lineTotal;
+            }
+        }
+
+        // Monthly revenue buckets (last 7 months)
+        const monthlyMap: Record<string, { revenue: number; orders: number }> = {};
+        for (const order of orders) {
+            if (order.status === 'CANCELLED') continue;
+            const key = new Date(order.createdAt).toLocaleString('en-US', { month: 'short', year: '2-digit' });
+            if (!monthlyMap[key]) monthlyMap[key] = { revenue: 0, orders: 0 };
+            monthlyMap[key].orders += 1;
+            for (const item of order.items) monthlyMap[key].revenue += item.price * item.quantity;
+        }
+
+        const topProducts = Object.entries(productMap)
+            .map(([id, v]) => ({ id, ...v }))
+            .sort((a, b) => b.revenue - a.revenue)
+            .slice(0, 5);
+
+        const categoryBreakdown = Object.entries(categoryMap)
+            .map(([name, value]) => ({ name, value: Math.round(value) }))
+            .sort((a, b) => b.value - a.value);
+
+        const activeProducts = await this.prisma.product.count({
+            where: { supplierId, status: 'APPROVED' },
+        });
+
+        const totalOrders = orders.filter(o => o.status !== 'CANCELLED').length;
+        const deliveredOrders = orders.filter(o => o.status === 'DELIVERED').length;
+
+        return {
+            totalRevenue,
+            totalOrders,
+            deliveredOrders,
+            totalItems,
+            activeProducts,
+            conversionRate: totalOrders > 0 ? ((deliveredOrders / totalOrders) * 100).toFixed(1) : '0',
+            monthlyData: Object.entries(monthlyMap).map(([month, v]) => ({ month, ...v })),
+            topProducts,
+            categoryBreakdown,
+        };
+    }
+
+    async findByIdForAdmin(orderId: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            include: {
+                customer: {
+                    select: {
+                        id: true, name: true, email: true, phone: true,
+                        companyName: true, country: true, vatNumber: true,
+                    },
+                },
+                items: {
+                    include: {
+                        product: {
+                            select: {
+                                id: true, name: true, images: true, brand: true,
+                                category: true, ean: true, unit: true,
+                                unitsPerCase: true, casesPerPallet: true,
+                                unitsPerPallet: true, palletsPerShipment: true,
+                                shelfLife: true, weight: true, stock: true,
+                                exwLocation: true, origin: true,
+                                // Pull the supplier with contact details so the
+                                // admin order page can render a per-item
+                                // "Contact Supplier" panel + portfolio link.
+                                // Operator workflow: admin sees the order →
+                                // pings the supplier to confirm they have the
+                                // stock → only after the supplier confirms
+                                // does the admin move the order to PROCESSING.
+                                supplier: {
+                                    select: {
+                                        id: true, name: true, email: true, phone: true,
+                                        companyName: true, country: true,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                history: { orderBy: { createdAt: 'asc' } },
+                shipment: {
+                    select: {
+                        trackingNumber: true, carrier: true,
+                        status: true, expectedDelivery: true,
+                    },
+                },
+            },
+        });
+
+        if (!order) throw new NotFoundException('Order not found');
+
+        return {
+            id: order.id,
+            status: order.status,
+            total: order.totalAmount,
+            createdAt: order.createdAt.toISOString(),
+            updatedAt: (order as any).updatedAt?.toISOString?.() ?? null,
+            trackingNumber: order.shipment?.trackingNumber ?? null,
+            carrier: order.shipment?.carrier ?? null,
+            expectedDelivery: order.shipment?.expectedDelivery?.toISOString() ?? null,
+            customer: order.customer ?? null,
+            items: order.items.map(item => ({
+                id: item.id,
+                quantity: item.quantity,
+                unitPrice: item.price,
+                totalPrice: item.price * item.quantity,
+                product: item.product ?? null,
+                // Surface the Shopify-style snapshot the buyer chose at
+                // checkout (variants + tier). The admin /orders/[id] page
+                // renders these as chips under the product name so ops
+                // can see exactly what was ordered without inferring it
+                // from price math.
+                selectedVariants: (item as any).selectedVariants ?? null,
+                selectedTier: (item as any).selectedTier ?? null,
+            })),
+        };
+    }
+
+    async findByIdWithItems(orderId: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            include: {
+                items: {
+                    include: {
+                        product: {
+                            select: {
+                                id: true,
+                                name: true,
+                                images: true,
+                                price: true,
+                            }
+                        }
+                    }
+                },
+                customer: {
+                    select: {
+                        id: true,
+                        name: true,
+                        email: true,
+                    }
+                },
+                supplier: {
+                    select: {
+                        id: true,
+                        name: true,
+                        email: true,
+                        stripeAccountId: true,
+                        stripeOnboarded: true,
+                    }
+                }
+            }
+        });
+
+        if (!order) {
+            throw new NotFoundException(
+                `Order ${orderId} not found`
+            );
+        }
+
+        return order;
+    }
+
+    async confirmDelivery(orderId: string, customerId: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+        });
+        if (!order) throw new NotFoundException('Order not found');
+        if (order.customerId !== customerId) {
+            throw new ForbiddenException('This order does not belong to you');
+        }
+        if (order.status !== OrderStatus.SHIPPED) {
+            throw new BadRequestException(
+                `Order must be SHIPPED to confirm delivery. Current status: ${order.status}`
+            );
+        }
+        return this.updateStatus(orderId, OrderStatus.DELIVERED, customerId, 'Customer confirmed delivery');
+    }
+
+    async notifyDeliveryDay(orderId: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+            include: { customer: { select: { email: true, name: true } } }
+        });
+
+        if (!order) throw new NotFoundException('Order not found');
+        if (!order.customer?.email) throw new BadRequestException('Customer has no email');
+
+        await this.emailService.sendArrivingTodayEmail(
+            order.customer.email,
+            order.customer.name,
+            order.id
+        );
+
+        return { success: true };
+    }
+
+    async hideOrder(orderId: string, customerId: string) {
+        const order = await this.prisma.order.findUnique({
+            where: { id: orderId },
+        });
+        if (!order) throw new NotFoundException('Order not found');
+        if (order.customerId !== customerId) throw new ForbiddenException('This order does not belong to you');
+
+        return this.prisma.order.update({
+            where: { id: orderId },
+            data: { deletedByCustomer: true },
+        });
+    }
+
+    async delete(orderId: string) {
+        // Administrative hard delete
+        return this.prisma.order.delete({
+            where: { id: orderId }
+        });
+    }
+
+    async bulkDelete(orderIds: string[]) {
+        return this.prisma.order.deleteMany({
+            where: { id: { in: orderIds } }
+        });
+    }
+
+    async getAdminAnalytics(timeframe: string = 'daily') {
+        // Fetch all non-cancelled orders with their items and suppliers
+        const orders = await this.prisma.order.findMany({
+            where: { status: { not: OrderStatus.CANCELLED } },
+            include: {
+                items: {
+                    include: {
+                        product: {
+                            include: {
+                                supplier: { select: { id: true, name: true, email: true } }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        const productStats: Record<string, { name: string, sales: number, revenue: number, image: string }> = {};
+        const supplierStats: Record<string, { name: string, revenue: number, orders: number }> = {};
+        const revenueTrends: Record<string, number> = {};
+
+        for (const order of orders) {
+            let dateKey: string;
+            
+            if (timeframe === 'monthly') {
+                dateKey = order.createdAt.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+            } else if (timeframe === 'weekly') {
+                // Get start of week (Sunday)
+                const d = new Date(order.createdAt);
+                const day = d.getDay();
+                const diff = d.getDate() - day;
+                const startOfWeek = new Date(d.setDate(diff));
+                dateKey = `Wk ${startOfWeek.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+            } else {
+                // Default: Daily
+                dateKey = order.createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+            }
+
+            revenueTrends[dateKey] = (revenueTrends[dateKey] || 0) + order.totalAmount;
+
+            for (const item of order.items) {
+                const prod = item.product;
+                if (!prod) continue;
+
+                // Product Stats
+                if (!productStats[prod.id]) {
+                    productStats[prod.id] = {
+                        name: prod.name,
+                        sales: 0,
+                        revenue: 0,
+                        image: prod.images?.[0] || ''
+                    };
+                }
+                productStats[prod.id].sales += item.quantity;
+                productStats[prod.id].revenue += item.price * item.quantity;
+
+                // Supplier Stats
+                const sup = prod.supplier;
+                if (sup) {
+                    if (!supplierStats[sup.id]) {
+                        supplierStats[sup.id] = { name: sup.name, revenue: 0, orders: 0 };
+                    }
+                    supplierStats[sup.id].revenue += item.price * item.quantity;
+                    supplierStats[sup.id].orders += 1;
+                }
+            }
+        }
+
+        const topProducts = Object.values(productStats)
+            .sort((a, b) => b.revenue - a.revenue)
+            .slice(0, 5);
+
+        const topSuppliers = Object.values(supplierStats)
+            .sort((a, b) => b.revenue - a.revenue)
+            .slice(0, 5);
+
+        const revenueData = Object.entries(revenueTrends)
+            .map(([name, revenue]) => ({ name, revenue }))
+            .sort((a, b) => {
+                // Very basic sort for chart display
+                return 0; // Keeping insertion order for now (linked to order dates)
+            })
+            .slice(timeframe === 'daily' ? -14 : -12); // Show more data for daily, less for others
+
+        return {
+            topProducts,
+            topSuppliers,
+            revenueData
+        };
+    }
+}

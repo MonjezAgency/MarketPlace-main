@@ -1,0 +1,1405 @@
+import { Injectable, Logger } from '@nestjs/common';
+import * as XLSX from 'xlsx';
+import * as JSZip from 'jszip';
+import { validate } from 'class-validator';
+import { plainToInstance } from 'class-transformer';
+import { AiAgentService } from '../ai-agent/ai-agent.service';
+
+export interface ValidationRow {
+    rowNumber: number;
+    success: boolean;
+    data?: any;
+    errors?: string[];
+}
+
+export interface ExcelReport {
+    totalRows: number;
+    successCount: number;
+    errorCount: number;
+    results: ValidationRow[];
+}
+
+@Injectable()
+export class ExcelService {
+    private readonly logger = new Logger(ExcelService.name);
+
+    constructor(private readonly aiAgent: AiAgentService) {}
+
+    /**
+     * BULLETPROOF PRICE DETECTOR — overrides AI/heuristic when wrong.
+     *
+     * Scans the first ~15 data rows. For each column, counts cells whose
+     * value contains a currency symbol (€, $, £, ¥) or currency code
+     * (EUR, USD, GBP). The column with the HIGHEST currency-symbol count
+     * (and at least 30% of its cells matching) becomes the price column.
+     *
+     * This single check fixes the most common bulk-upload failure: the
+     * AI/heuristic picks "Available in PALLETS" (values like 0.06, 2.62)
+     * instead of " € 1.99 " because both are decimals.
+     *
+     * Returns the column index that should be price, or -1 if none found.
+     */
+    private detectPriceColumnByCurrency(rows: any[][], headerRowIndex: number): number {
+        const currencyRegex = /[€$£¥]|\bEUR\b|\bUSD\b|\bGBP\b|\bAED\b|\bSAR\b|\bEGP\b/i;
+        const dataRows = rows.slice(headerRowIndex + 1, headerRowIndex + 16);
+        if (dataRows.length === 0) return -1;
+
+        const maxCols = Math.max(...dataRows.map(r => (r || []).length), 0);
+        const scores: { col: number; matches: number; nonEmpty: number }[] = [];
+
+        for (let col = 0; col < maxCols; col++) {
+            let matches = 0;
+            let nonEmpty = 0;
+            for (const row of dataRows) {
+                const cell = row?.[col];
+                if (cell === undefined || cell === null || String(cell).trim() === '') continue;
+                nonEmpty++;
+                if (currencyRegex.test(String(cell))) matches++;
+            }
+            if (matches > 0) scores.push({ col, matches, nonEmpty });
+        }
+
+        if (scores.length === 0) return -1;
+        // Best column = highest match count, tie-broken by highest match ratio
+        scores.sort((a, b) => {
+            if (b.matches !== a.matches) return b.matches - a.matches;
+            return (b.matches / b.nonEmpty) - (a.matches / a.nonEmpty);
+        });
+        const best = scores[0];
+        const ratio = best.matches / Math.max(best.nonEmpty, 1);
+        if (ratio < 0.3) return -1;
+        this.logger.log(`[ExcelService] Currency-detector: col ${best.col} has ${best.matches}/${best.nonEmpty} cells with currency symbols → price.`);
+        return best.col;
+    }
+
+    /**
+     * Apply the currency-detector result to a mapping. If a price column
+     * is found by currency symbols, it OVERRIDES whatever the AI/heuristic
+     * picked. Any other column previously labeled "price" is demoted to null.
+     */
+    private overridePriceMapping(
+        mapping: Record<number, string | null>,
+        priceCol: number,
+    ): Record<number, string | null> {
+        if (priceCol < 0) return mapping;
+        const out: Record<number, string | null> = { ...mapping };
+        // Demote any existing 'price' assignment that's NOT the detected column
+        for (const [k, v] of Object.entries(out)) {
+            if (v === 'price' && Number(k) !== priceCol) {
+                this.logger.log(`[ExcelService] Demoting wrongly-detected price column ${k} → null (currency-detector picked col ${priceCol}).`);
+                out[Number(k)] = null;
+            }
+        }
+        // If the detected price column was previously assigned to something
+        // else, force it to be price (price wins over other guesses for this column)
+        if (out[priceCol] !== 'price') {
+            this.logger.log(`[ExcelService] Forcing col ${priceCol} → 'price' (was: ${out[priceCol]}).`);
+            out[priceCol] = 'price';
+        }
+        return out;
+    }
+
+    async processProductsExcel(buffer: Buffer, dtoClass: any): Promise<ExcelReport> {
+        const workbook = XLSX.read(buffer, { type: 'buffer' });
+        if (!workbook.SheetNames || workbook.SheetNames.length === 0) {
+            throw new Error('Excel file has no sheets');
+        }
+
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        if (!sheet) throw new Error(`Sheet "${sheetName}" not found`);
+
+        // 1. Extract embedded images mapping
+        const imageMapping = await this.extractImagesFromZip(buffer, sheetName);
+        console.log(`[ExcelService] Extracted ${Object.keys(imageMapping).length} embedded images.`);
+
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' }) as any[][];
+        if (rows.length === 0) throw new Error('Sheet is empty');
+
+        // FORMATTED rows — same shape as `rows` but cells use the display
+        // string (`.w`) so currency symbols, percentages, etc. are visible.
+        // Excel stores " € 0.38 " as raw number 0.38 with format "€ #.##",
+        // so we need this to detect currency columns.
+        const rowsFormatted = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false }) as any[][];
+
+        console.log(`[ExcelService] Processing ${rows.length} raw rows from sheet: ${sheetName}`);
+
+        // \u2500\u2500 AI-FIRST COLUMN DETECTION \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        // Send the first ~12 rows to an LLM to figure out which column is
+        // which \u2014 works regardless of column order, header position, or
+        // unusual layouts. Falls back to header-name heuristics if the LLM
+        // is unavailable, returns low confidence, or fails.
+        try {
+            const aiResult = await this.aiAgent.detectColumnMapping(rows.slice(0, 12));
+            if (aiResult && aiResult.confidence !== 'low') {
+                this.logger.log(`[ExcelService] Using AI mapping (confidence: ${aiResult.confidence}). ${aiResult.reasoning || ''}`);
+                // BULLETPROOF OVERRIDE: scan data for currency symbols and
+                // force the price column. Catches AI mistakes where it picks
+                // "Available in PALLETS" (decimals like 0.06, 2.62) as price.
+                const priceCol = this.detectPriceColumnByCurrency(rowsFormatted, aiResult.headerRowIndex);
+                const finalMapping = this.overridePriceMapping(aiResult.mapping, priceCol);
+                return this.processWithMapping(
+                    rows,
+                    finalMapping,
+                    aiResult.headerRowIndex,
+                    dtoClass,
+                    await this.extractImagesFromZip(buffer, sheetName),
+                );
+            }
+            this.logger.log(`[ExcelService] AI unavailable or low-confidence \u2014 falling back to header heuristics.`);
+        } catch (e: any) {
+            this.logger.warn(`[ExcelService] AI mapping threw: ${e?.message} \u2014 using heuristics.`);
+        }
+
+        const normalize = (s: string) => String(s || '').toLowerCase().replace(/[^a-z0-9\u0600-\u06FF]/g, '').trim();
+
+        const headerAliases: Record<string, string> = {
+            // ── name ──────────────────────────────────────────────────────────
+            'name': 'name', 'title': 'name', 'productname': 'name', 'product': 'name',
+            'label': 'name', 'item': 'name', 'itemname': 'name',
+            'اسمبالعربي': 'name', 'الاسم': 'name', 'اسم': 'name', 'اسمالمنتج': 'name',
+            'المنتج': 'name', 'اسمباحث': 'name',
+            // ── description ───────────────────────────────────────────────────
+            'description': 'description', 'desc': 'description', 'details': 'description',
+            'info': 'description', 'note': 'description', 'notes': 'description',
+            'الوصف': 'description', 'التفاصيل': 'description', 'وصف': 'description', 'ملاحظات': 'description',
+            // ── price ─────────────────────────────────────────────────────────
+            'price': 'price', 'cost': 'price', 'rate': 'price', 'amount': 'price',
+            'unitprice': 'price', 'saleprice': 'price', 'sellingprice': 'price', 'baseprice': 'price',
+            // Per-piece price variants — operator's Atlantis CSV uses
+            // "Price per Piece (USD)" which used to fall through.
+            'priceperpiece': 'price', 'priceperpieceusd': 'price',
+            'priceperpieceeur': 'price', 'priceperpiecegbp': 'price',
+            'pricepiece': 'price', 'priceperunit': 'price', 'priceperunitusd': 'price',
+            // Per-case / per-carton variants
+            'pricepercase': 'price', 'priceperpack': 'price', 'priceperpackusd': 'price',
+            'pricepercaseusd': 'price', 'pricepercaseeur': 'price',
+            'pricepercarton': 'price', 'pricepercartonusd': 'price',
+            // Offer/wholesale variants — Tena offer file used "Price offer".
+            'priceoffer': 'price', 'offerprice': 'price', 'wholesaleprice': 'price',
+            'wholesalepriceusd': 'price', 'wholesalepriceeur': 'price',
+            'b2bprice': 'price', 'tradeprice': 'price',
+            // "Price Exw <city>" pattern — Swiffer file. Both the price
+            // AND the EXW origin are stuffed into one header. We map it
+            // to price; sheet-level EXW extraction (detectSheetLevelExw)
+            // separately picks the city out of the same header text.
+            'priceexw': 'price', 'priceexworks': 'price',
+            'السعر': 'price', 'سعرالبيع': 'price', 'سعر': 'price', 'القيمة': 'price', 'ثمن': 'price',
+            // ── stock ─────────────────────────────────────────────────────────
+            'stock': 'stock', 'stockcount': 'stock', 'quantity': 'stock', 'qty': 'stock',
+            'count': 'stock', 'inventory': 'stock', 'available': 'stock',
+            'availablephysicalincases': 'stock', 'availableincases': 'stock',
+            'availablephysical': 'stock', 'physicalqty': 'stock',
+            'الكمية': 'stock', 'المخزون': 'stock', 'العدد': 'stock', 'كمية': 'stock',
+            // ── category ──────────────────────────────────────────────────────
+            'category': 'category', 'type': 'category', 'dept': 'category',
+            'department': 'category', 'group': 'category', 'section': 'category',
+            'الفئة': 'category', 'القسم': 'category', 'التصنيف': 'category',
+            'نوع': 'category', 'فئة': 'category', 'صنف': 'category',
+            'المجموعة': 'category', 'مجموعة': 'category',
+            // ── ean / item number ─────────────────────────────────────────────
+            'ean': 'ean', 'barcode': 'ean', 'upc': 'ean', 'sku': 'ean',
+            // Compound headers — these used to fall through after we
+            // raised the partial-match cutoff to 6 chars. 'ean' / 'upc'
+            // by themselves only match exact now, so spell out the
+            // common compound variants explicitly.
+            'eancode': 'ean', 'eannumber': 'ean', 'ean13': 'ean', 'ean8': 'ean',
+            'upccode': 'ean', 'upcnumber': 'ean',
+            'barcodeean': 'ean', 'barcodenumber': 'ean', 'barcodeno': 'ean',
+            'productbarcode': 'ean', 'productean': 'ean',
+            'code': 'ean', 'productcode': 'ean', 'itemnumber': 'ean', 'itemno': 'ean',
+            'itemnr': 'ean', 'artikelnummer': 'ean', 'articlenumber': 'ean',
+            'الباركود': 'ean', 'كودالمنتج': 'ean', 'كود': 'ean', 'رقم': 'ean',
+            // ── unitsPerCase (Pcs/case — values like "C24") ───────────────────
+            'unitspercase': 'unitsPerCase', 'pcspercase': 'unitsPerCase',
+            'pcscase': 'unitsPerCase', 'piecespercase': 'unitsPerCase',
+            'itemspercase': 'unitsPerCase', 'qtypercase': 'unitsPerCase',
+            'percase': 'unitsPerCase',
+            // "Pieces per Carton" (and the "carton" family) — many supplier
+            // CSVs use "carton" instead of "case". Treat them as synonyms.
+            'piecespercarton': 'unitsPerCase', 'pcspercarton': 'unitsPerCase',
+            'pcscarton': 'unitsPerCase', 'unitspercarton': 'unitsPerCase',
+            'itemspercarton': 'unitsPerCase', 'qtypercarton': 'unitsPerCase',
+            'percarton': 'unitsPerCase', 'piecespercartonctn': 'unitsPerCase',
+            'piecesperctn': 'unitsPerCase', 'pcsperctn': 'unitsPerCase',
+            'piecesperbox': 'unitsPerCase', 'unitsperbox': 'unitsPerCase',
+            'pcsperbox': 'unitsPerCase', 'itemsperbox': 'unitsPerCase',
+            'perbox': 'unitsPerCase', 'pcsbox': 'unitsPerCase',
+            'عددالوحداتفيالكرتون': 'unitsPerCase', 'وحداتالكرتون': 'unitsPerCase',
+            'القطعةفيالكرتون': 'unitsPerCase', 'قطعكرتون': 'unitsPerCase',
+            // ── casesPerPallet ────────────────────────────────────────────────
+            'casesperpallet': 'casesPerPallet', 'boxesperpallet': 'casesPerPallet',
+            'cartonsperpallets': 'casesPerPallet', 'caseperpallet': 'casesPerPallet',
+            // After normalize() strips the slash, "case/pallet" → "casepallet"
+            // — without this alias the column was silently dropped.
+            'casepallet': 'casesPerPallet', 'cartonpallet': 'casesPerPallet',
+            'boxpallet': 'casesPerPallet',
+            // "Cartons per Pallet" — the carton/case synonym again.
+            'cartonsperpallet': 'casesPerPallet', 'cartonperpallet': 'casesPerPallet',
+            'ctnperpallet': 'casesPerPallet', 'ctnsperpallet': 'casesPerPallet',
+            'boxperpallet': 'casesPerPallet',
+            'كراتينالبالتة': 'casesPerPallet', 'عددالكراتينفيالبالتة': 'casesPerPallet',
+            'كرتونبالتة': 'casesPerPallet',
+            // ── unitsPerPallet ────────────────────────────────────────────────
+            // NOTE: do NOT map "Available physical in pallets" here — that
+            // is the total stock expressed in pallet units (e.g. 2.62 pallets
+            // available), NOT the pieces-per-pallet conversion factor.
+            // We auto-compute unitsPerPallet = casesPerPallet × unitsPerCase.
+            'unitsperpallet': 'unitsPerPallet', 'itemsperpallet': 'unitsPerPallet',
+            'palletunits': 'unitsPerPallet', 'palletqty': 'unitsPerPallet',
+            'piecesperpallet': 'unitsPerPallet', 'pcsperpallet': 'unitsPerPallet',
+            // normalize() strips the slash, so "pcs/pallet" → "pcspallet" and
+            // "pieces/pallet" → "piecespallet". Without these aliases those
+            // columns were silently dropped.
+            'pcspallet': 'unitsPerPallet', 'piecespallet': 'unitsPerPallet',
+            'unitpallet': 'unitsPerPallet', 'itempallet': 'unitsPerPallet',
+            'عددالوحداتفيالبالتة': 'unitsPerPallet', 'وحداتالبالتة': 'unitsPerPallet',
+            'البالتةفيهاكام': 'unitsPerPallet',
+            // ── palletsPerShipment ────────────────────────────────────────────
+            'palletspershipment': 'palletsPerShipment', 'palletsperload': 'palletsPerShipment',
+            'shipmentpallets': 'palletsPerShipment',
+            // "Pallets in Shipment" / "Pallets per Truck" / "Pallets per Container"
+            'palletsinshipment': 'palletsPerShipment', 'palletsintruck': 'palletsPerShipment',
+            'palletspertruck': 'palletsPerShipment', 'palletpertruck': 'palletsPerShipment',
+            'palletspercontainer': 'palletsPerShipment',
+            'pallettruck': 'palletsPerShipment', 'palletcontainer': 'palletsPerShipment',
+            'truckpallets': 'palletsPerShipment', 'containerpallets': 'palletsPerShipment',
+            'palletsinload': 'palletsPerShipment', 'palletsinfcl': 'palletsPerShipment',
+            'عددالبالتاتفيالشحنة': 'palletsPerShipment', 'البالتاتفيالشحنة': 'palletsPerShipment',
+            'بالتاتالشحنة': 'palletsPerShipment', 'بالتاتالشاحنة': 'palletsPerShipment',
+            // ── moq / minOrder ────────────────────────────────────────────────
+            // DTO field name is "moq". All common aliases point to it.
+            'moq': 'moq', 'mqq': 'moq', 'minorder': 'moq',
+            'minimumorder': 'moq', 'minimumorderquantity': 'moq',
+            'minqty': 'moq', 'minimumquantity': 'moq',
+            'mimimumquantity': 'moq',  // common typo
+            'orderlimit': 'moq',
+            'الحدالأدنى': 'moq', 'حدالطلب': 'moq', 'الحدالادنى': 'moq',
+            'أقلكمية': 'moq', 'اقلكمية': 'moq',
+            // ── moqUnit ───────────────────────────────────────────────────────
+            // Optional unit that the MOQ is expressed in. Allowed values:
+            // PIECE / CASE / PALLET / TRUCK (case-insensitive on input).
+            'moqunit': 'moqUnit', 'minorderunit': 'moqUnit',
+            'orderunit': 'moqUnit', 'unitofmoq': 'moqUnit',
+            // ── brand ─────────────────────────────────────────────────────────
+            // NOTE: do NOT map "Brand Status" here. That's a verification
+            // flag ("Verified by Atlantis" / "Unverified"), not the brand
+            // name. It used to partial-match "brand" and overwrite the
+            // brand field with the literal string "Verified by Atlantis".
+            // The "brandstatus" alias below is explicitly dropped so the
+            // column is left unmapped.
+            'brand': 'brand', 'make': 'brand', 'manufacturer': 'brand',
+            'productbrand': 'brand', 'brandname': 'brand',
+            'براند': 'brand', 'الماركة': 'brand', 'الشركةالمصنعة': 'brand',
+            // ── unit ──────────────────────────────────────────────────────────
+            // "Unit Type" was being CORRUPTED before this fix: the partial
+            // matcher saw "Weight per Unit (kg)" (normalized to
+            // "weightperunitkg") and matched the substring "unit", which
+            // pointed the column at the `unit` field instead of `weight`.
+            // We now add an explicit "unittype" alias (exact match wins)
+            // and the partial-match cutoff was raised to 6 chars below so
+            // 4-char aliases like "unit" can only match exactly.
+            'unit': 'unit', 'unittype': 'unit', 'producttype': 'unit',
+            'measure': 'unit', 'packaging': 'unit', 'packtype': 'unit',
+            'الوحدة': 'unit', 'التعبئة': 'unit', 'نوعالوحدة': 'unit',
+            // ── shelfLife / expiry ────────────────────────────────────────────
+            'expirydate': 'shelfLife', 'expiry': 'shelfLife', 'bestbefore': 'shelfLife',
+            'batchnumber': 'shelfLife', 'batchno': 'shelfLife', 'lot': 'shelfLife',
+            'lotnumber': 'shelfLife', 'batchnumberexpirydate': 'shelfLife',
+            'bbd': 'shelfLife', 'bestbeforedate': 'shelfLife',
+            // ── origin (country of manufacture / origin) ─────────────────────
+            // Atlantis FMCG catalog uses "Country of Origin", other
+            // suppliers shorten to "Origin" or "Made in". This is
+            // distinct from EXW location (where goods physically sit
+            // today vs where they were manufactured).
+            'origin': 'origin', 'countryoforigin': 'origin', 'origincountry': 'origin',
+            'madein': 'origin', 'manufacturedin': 'origin', 'producedin': 'origin',
+            'countryofmanufacture': 'origin', 'countryofproduction': 'origin',
+            'productorigin': 'origin', 'sourcecountry': 'origin',
+            'بلدالمنشأ': 'origin', 'منشأ': 'origin', 'المنشأ': 'origin',
+            'بلدالصنع': 'origin', 'صنعفي': 'origin',
+            // ── EXW (Ex Works location — where the goods physically sit) ─────
+            // Atlantis logistics uses this to quote transport from origin to
+            // the buyer. We accept many phrasings because suppliers write it
+            // a dozen different ways: "EXW", "Ex Works", "EXW Origin",
+            // "Origin Warehouse", "Stock Location", "Currently Located in",
+            // plus Arabic variants. normalize() strips spaces/dashes so
+            // "Ex-Works" → "exworks", "EXW Location" → "exwlocation", etc.
+            'exw': 'exwLocation', 'exworks': 'exwLocation', 'exwlocation': 'exwLocation',
+            'exwincoterm': 'exwLocation', 'exworigin': 'exwLocation',
+            'originwarehouse': 'exwLocation', 'warehouselocation': 'exwLocation',
+            'stocklocation': 'exwLocation', 'currentlocation': 'exwLocation',
+            'goodslocation': 'exwLocation', 'productlocation': 'exwLocation',
+            'shipfrom': 'exwLocation', 'departure': 'exwLocation',
+            'departurecountry': 'exwLocation', 'pickuplocation': 'exwLocation',
+            // "Currently In" / "Currently Located" / "Currently Stocked In"
+            'currentlyin': 'exwLocation', 'currentlylocated': 'exwLocation',
+            'currentlylocatedin': 'exwLocation', 'currentlystockedin': 'exwLocation',
+            'currentlystored': 'exwLocation', 'currentlystoredin': 'exwLocation',
+            'storedin': 'exwLocation', 'locatedin': 'exwLocation',
+            'whereis': 'exwLocation', 'wherelocated': 'exwLocation',
+            'physicallocation': 'exwLocation', 'physicallyin': 'exwLocation',
+            'incoterm': 'exwLocation', 'incoterms': 'exwLocation',
+            'مكانالبضاعة': 'exwLocation', 'مكانالمنتج': 'exwLocation',
+            'موقعالمنتج': 'exwLocation',
+            // NOTE: 'بلدالمنشأ' (country of origin) intentionally lives in
+            // the origin alias block above, not here. The exwLocation
+            // semantic is "where the goods physically sit today" which
+            // is distinct from country of manufacture.
+            'مخزن': 'exwLocation', 'موقعالشحن': 'exwLocation',
+            // ── images (URLs, comma/semicolon/pipe/newline-separated) ─────────
+            'image': 'images', 'images': 'images', 'imageurl': 'images',
+            'imageurls': 'images', 'photo': 'images', 'photos': 'images',
+            'picture': 'images', 'pictures': 'images', 'pic': 'images',
+            'imagelink': 'images', 'imagelinks': 'images', 'productimage': 'images',
+            'productimages': 'images', 'productimageurl': 'images',
+            'الصورة': 'images', 'الصور': 'images', 'صورة': 'images', 'رابطالصورة': 'images',
+        };
+
+        // ── Header detection ────────────────────────────────────────────────
+        // Some supplier files split the header across TWO rows, e.g.:
+        //   Row 0: "Item number" | "Item name" | "Batch number/" | "Available physical" | "Pcs/case" | ...
+        //   Row 1:  <empty>      |   <empty>   | "Expiry Date"   | "in CASES !!"        |   <empty>  | ...
+        // We merge consecutive candidate rows to handle this pattern.
+        // Each column gets a target field AND a confidence score:
+        //   exact match → 2 (e.g. "Item number" → exact 'itemnumber' alias → 'ean')
+        //   partial match → 1 (e.g. "Item label" → partial via "label" → 'name')
+        // When two columns end up mapped to the same target field, the one
+        // with the higher confidence wins. This fixes the case where
+        // "Item number" partial-matched 'item' → 'name' and stole the slot
+        // from "Item name" (which was an exact match).
+        const matchRow = (row: any[]): { mapping: Record<number, { target: string; confidence: number }>; matches: number } => {
+            const tempMapping: Record<number, { target: string; confidence: number }> = {};
+            let matches = 0;
+            row.forEach((cell, idx) => {
+                if (cell === undefined || cell === null || cell === '') return;
+                const normalizedCell = normalize(String(cell));
+                if (headerAliases[normalizedCell]) {
+                    tempMapping[idx] = { target: headerAliases[normalizedCell], confidence: 2 };
+                    matches++;
+                    return;
+                }
+                // ── Deny list ────────────────────────────────────────
+                // Columns we deliberately refuse to map, even by partial
+                // match. These tend to collide with a short alias and
+                // overwrite the real field with garbage. "Brand Status"
+                // is the canonical example — it used to partial-match
+                // "brand" and set the brand to the literal string
+                // "Verified by Atlantis".
+                const DENY = new Set<string>([
+                    'brandstatus',     // verification flag, not a brand
+                    'productstatus',
+                    'status',
+                    'verified',
+                    'verification',
+                    'exwusd',          // numeric price column — NOT an
+                    'exwprice',        // EXW LOCATION (despite the name).
+                ]);
+                if (DENY.has(normalizedCell)) return;
+
+                // Partial fallback — only if alias is at least 6 chars.
+                // Earlier we used 4, which let aliases like "unit" / "moq"
+                // / "brand" / "name" partial-match compound headers like
+                // "Weight per Unit (kg)" and corrupt the data. 6 chars
+                // means only specific multi-word aliases (e.g. "weight",
+                // "origin", "shelfLife", "pallets") survive — short
+                // generic aliases must match the header EXACTLY.
+                for (const [alias, target] of Object.entries(headerAliases)) {
+                    if (alias.length < 6) continue;
+                    if (normalizedCell.length > 2 && (normalizedCell.includes(alias) || alias.includes(normalizedCell))) {
+                        tempMapping[idx] = { target, confidence: 1 };
+                        matches++;
+                        break;
+                    }
+                }
+            });
+            return { mapping: tempMapping, matches };
+        };
+
+        // After matching, resolve same-target conflicts by keeping the
+        // highest-confidence column per target field. When two columns
+        // tie on confidence, we apply a semantic tiebreak using the
+        // original header text — needed for cases like the Atlantis
+        // CSV which has BOTH "Pallet per Truck" (truck capacity) AND
+        // "Pallets in Shipment" (actual count). Both alias-match to
+        // palletsPerShipment, but the "shipment" header is the one we
+        // actually want for the order. headerRow is passed in so the
+        // tiebreak can read the original cell strings.
+        const resolveConflicts = (
+            raw: Record<number, { target: string; confidence: number }>,
+            headerRow: any[],
+        ): Record<number, string> => {
+            // Per-target semantic priority. Headers that contain any of
+            // the listed substrings (post-normalize) get a +0.5
+            // confidence bump so they win tiebreaks against more
+            // generic synonyms. The bump is < 1 so an exact match
+            // anywhere else still trumps a partial-match here.
+            const SEMANTIC_PRIORITY: Record<string, string[]> = {
+                palletsPerShipment: ['shipment', 'load', 'container', 'fcl'],
+                exwLocation: ['exw', 'currently', 'physical', 'stock'],
+                origin: ['origin', 'manufactured', 'madein', 'produced'],
+                price: ['piece', 'unit', 'wholesale', 'offer', 'b2b'],
+            };
+            const score = (col: number, target: string, baseConf: number): number => {
+                const priorities = SEMANTIC_PRIORITY[target];
+                if (!priorities) return baseConf;
+                const cell = normalize(String(headerRow[col] ?? ''));
+                if (priorities.some((p) => cell.includes(p))) {
+                    return baseConf + 0.5;
+                }
+                return baseConf;
+            };
+
+            const bestPerTarget: Record<string, { col: number; confidence: number }> = {};
+            for (const [colStr, info] of Object.entries(raw)) {
+                const col = Number(colStr);
+                const adjusted = score(col, info.target, info.confidence);
+                const existing = bestPerTarget[info.target];
+                if (!existing || adjusted > existing.confidence) {
+                    bestPerTarget[info.target] = { col, confidence: adjusted };
+                }
+            }
+            const flat: Record<number, string> = {};
+            for (const [target, { col }] of Object.entries(bestPerTarget)) {
+                flat[col] = target;
+            }
+            return flat;
+        };
+
+        let headerRowIndex = -1;
+        let mapping: Record<number, string> = {};
+
+        for (let i = 0; i < Math.min(rows.length, 30); i++) {
+            const row = rows[i];
+            if (!row || row.length === 0) continue;
+
+            const { mapping: m1, matches: c1 } = matchRow(row);
+
+            // If next row exists and is a sub-header continuation, merge it
+            const mergedRaw: Record<number, { target: string; confidence: number }> = { ...m1 };
+            let totalMatches = c1;
+
+            if (i + 1 < rows.length) {
+                const nextRow = rows[i + 1] || [];
+                const { mapping: m2, matches: c2 } = matchRow(nextRow);
+                const nextNonEmpty = nextRow.filter(c => c !== undefined && c !== null && String(c).trim() !== '').length;
+                const nextIsSubHeader = c2 >= 1 && (c2 / Math.max(nextNonEmpty, 1)) > 0.3;
+                if (nextIsSubHeader) {
+                    for (const [col, info] of Object.entries(m2)) {
+                        if (!mergedRaw[Number(col)]) {
+                            mergedRaw[Number(col)] = info;
+                            totalMatches++;
+                        }
+                    }
+                }
+            }
+
+            if (totalMatches >= 2) {
+                headerRowIndex = i;
+                mapping = resolveConflicts(mergedRaw, row);
+                if (i + 1 < rows.length) {
+                    const nextRow = rows[i + 1] || [];
+                    const { matches: c2 } = matchRow(nextRow);
+                    const nextNonEmpty = nextRow.filter(c => c !== undefined && c !== null && String(c).trim() !== '').length;
+                    if (c2 >= 1 && (c2 / Math.max(nextNonEmpty, 1)) > 0.3) {
+                        headerRowIndex = i + 1;
+                    }
+                }
+                console.log(`[ExcelService] Header found at row ${i} with ${totalMatches} matches. Final mapping:`, mapping);
+                break;
+            }
+        }
+
+        // BULLETPROOF PRICE OVERRIDE for heuristic path too — currency
+        // symbols in cell data always win over header-name guesses.
+        if (headerRowIndex !== -1) {
+            const priceCol = this.detectPriceColumnByCurrency(rowsFormatted, headerRowIndex);
+            if (priceCol >= 0) {
+                const overridden = this.overridePriceMapping(mapping as any, priceCol);
+                // Convert back to non-nullable form (filter out null entries)
+                const cleaned: Record<number, string> = {};
+                for (const [k, v] of Object.entries(overridden)) {
+                    if (v) cleaned[Number(k)] = v;
+                }
+                mapping = cleaned;
+            }
+        }
+
+        // FALLBACK: try sheet_to_json with auto headers
+        if (headerRowIndex === -1) {
+            console.warn('[ExcelService] No header via matching, trying auto-json fallback...');
+            const jsonRows = XLSX.utils.sheet_to_json(sheet, { defval: '' }) as Record<string, any>[];
+            if (jsonRows.length > 0) {
+                const firstKeys = Object.keys(jsonRows[0]);
+                const autoMapping: Record<string, string> = {};
+                for (const key of firstKeys) {
+                    const nk = normalize(key);
+                    if (headerAliases[nk]) {
+                        autoMapping[key] = headerAliases[nk];
+                    } else {
+                        for (const [alias, target] of Object.entries(headerAliases)) {
+                            // Skip too-short aliases that cause wide false positives
+                            if (alias.length < 4) continue;
+                            if (nk.length > 2 && (nk.includes(alias) || alias.includes(nk))) {
+                                autoMapping[key] = target;
+                                break;
+                            }
+                        }
+                    }
+                }
+                return this.processJsonRows(jsonRows, autoMapping, dtoClass);
+            }
+            throw new Error('Could not identify header row in Excel file. Please use the provided template.');
+        }
+
+        const results: ValidationRow[] = [];
+        let successCount = 0;
+        let errorCount = 0;
+
+        // ── Sheet-level EXW fallback ────────────────────────────────────────────
+        // Suppliers often write EXW once at the top OR bottom of the sheet
+        // ("Prices are EXW Thessaloniki -GR") rather than as a per-row column.
+        // We scan the whole sheet for a "EXW <country>" / "Ex Works <country>"
+        // pattern and use it as the default for any row that doesn't have its
+        // own exwLocation. Any explicit per-row EXW still wins.
+        const sheetLevelExw = this.detectSheetLevelExw(rows);
+        if (sheetLevelExw) {
+            this.logger.log(`[ExcelService] Sheet-level EXW detected: "${sheetLevelExw}" — applied as fallback to rows without an explicit EXW column.`);
+        }
+
+        for (let i = headerRowIndex + 1; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row) continue;
+            
+            const hasData = row.some(c => c !== undefined && c !== null && String(c).trim() !== '');
+            if (!hasData) continue;
+
+            const normalizedRow: Record<string, any> = {};
+            // First-wins: if multiple columns map to the same target field
+            // (e.g. 'Item number' AND 'Batch number' both → ean before
+            // disambiguation), the first non-empty value wins. This
+            // protects key fields like price/EAN from being overridden by
+            // a later column with the same alias.
+            row.forEach((cell, idx) => {
+                const targetKey = mapping[idx];
+                if (!targetKey) return;
+                if (cell === undefined || cell === null || String(cell).trim() === '') return;
+                if (normalizedRow[targetKey] !== undefined) return;
+                normalizedRow[targetKey] = cell;
+            });
+
+            this.coerceTypes(normalizedRow);
+
+            // Skip footer/policy/note rows. Suppliers commonly add a row at the
+            // bottom of their sheet like "Minimum Order 6 pallets mixed - Prices
+            // are EXW Thessaloniki -GR" — that's a policy comment, not a
+            // product. Detected by: a name-only row (no EAN, no real price,
+            // no logistics fields) that contains note-keywords. The MOQ value
+            // is extracted into the file-level metadata so we can warn the
+            // admin about the policy without polluting the catalog with a
+            // garbage product.
+            if (this.isNoteRow(normalizedRow)) {
+                this.logger.log(
+                    `[ExcelService] Row ${i + 1} skipped as policy/footer note: ` +
+                    `"${String(normalizedRow.name).slice(0, 80)}"`
+                );
+                continue;
+            }
+
+            // Auto-extract brand and weight from the product name when the
+            // sheet didn't supply them as their own column. Pulls "Pepsi"
+            // out of "Pepsi Diet 150ml" and "150ml" out of the same name.
+            this.enrichFromName(normalizedRow);
+
+            // Description is required by the DTO (MinLength 10). If the
+            // supplier left it blank we synthesise a minimal one from the
+            // brand + name + weight + shelf-life so the row doesn't fail
+            // validation just for that. Suppliers who care about SEO can
+            // still override with a real description on their next edit.
+            if (!normalizedRow.description || String(normalizedRow.description).trim().length < 10) {
+                const parts: string[] = [];
+                if (normalizedRow.brand) parts.push(String(normalizedRow.brand));
+                if (normalizedRow.name)  parts.push(String(normalizedRow.name));
+                if (normalizedRow.weight) parts.push(`(${normalizedRow.weight})`);
+                if (normalizedRow.shelfLife) parts.push(`— BBD ${normalizedRow.shelfLife}`);
+                const synth = parts.join(' ').trim();
+                if (synth.length >= 10) normalizedRow.description = synth;
+            }
+
+            // ── EXW resolution ──────────────────────────────────────────────
+            // Best-effort: try column → row inline → sheet-level. If still
+            // empty we DON'T fail the row anymore — the supplier can fill
+            // it in from the product edit page after the upload lands.
+            // Operator decision: blocking 57 KitKat rows because a
+            // supplier sheet didn't bake "EXW" into a header was a
+            // worse experience than letting them complete it later.
+            if (!normalizedRow.exwLocation) {
+                const inlineExw = this.extractExwFromCells(row);
+                if (inlineExw) normalizedRow.exwLocation = inlineExw;
+            }
+            if (!normalizedRow.exwLocation && sheetLevelExw) {
+                normalizedRow.exwLocation = sheetLevelExw;
+            }
+
+            // ── Unit type fallback ─────────────────────────────────────────
+            // Most B2B uploads are case-level (the file has a Pcs/case
+            // column, MOQ in cases, etc.). When the sheet doesn't pin
+            // a unit type explicitly, default to "case" so the row
+            // doesn't get rejected for `unit: Missing`. Suppliers can
+            // still flip it to Piece/Pallet/Truck from the edit page.
+            if (!normalizedRow.unit) {
+                normalizedRow.unit = 'case';
+            }
+
+            // Log first 3 data rows so the operator can verify extraction
+            if (i - headerRowIndex <= 3) {
+                console.log(`[ExcelService] Row ${i + 1} extracted:`, JSON.stringify({
+                    name: normalizedRow.name,
+                    ean: normalizedRow.ean,
+                    price: normalizedRow.price,
+                    stock: normalizedRow.stock,
+                    unitsPerCase: normalizedRow.unitsPerCase,
+                    casesPerPallet: normalizedRow.casesPerPallet,
+                    unitsPerPallet: normalizedRow.unitsPerPallet,
+                    shelfLife: normalizedRow.shelfLife,
+                    brand: normalizedRow.brand,
+                    weight: normalizedRow.weight,
+                }));
+            }
+
+            // Attach embedded image if exists for this row
+            if (imageMapping[i]) {
+                normalizedRow.images = [imageMapping[i]];
+            }
+
+            const instance = plainToInstance(dtoClass, normalizedRow, { enableImplicitConversion: true });
+            const errors = await validate(instance as any);
+
+            // EXW is now best-effort, not a hard requirement. If still
+            // empty after column / inline / sheet-level resolution, the
+            // row passes through and the supplier completes it on the
+            // edit page. See block above for the operator rationale.
+
+            if (errors.length > 0) {
+                errorCount++;
+                const errorMessages = errors.map(err =>
+                    `${err.property}: ${Object.values(err.constraints || {}).join(', ')}`
+                );
+                results.push({ rowNumber: i + 1, success: false, errors: errorMessages });
+            } else {
+                successCount++;
+                results.push({ rowNumber: i + 1, success: true, data: instance });
+            }
+        }
+
+        return { totalRows: results.length, successCount, errorCount, results };
+    }
+
+    /**
+     * Walks every cell of every row — including header rows — to find an
+     * EXW value the supplier may have written somewhere other than a
+     * dedicated column. Suppliers commonly bake the EXW INTO a column
+     * header (e.g. "Price EXW IT" or "Price & EXW in GR") rather than
+     * using a separate EXW column, OR they write a footer note like
+     * "Prices are EXW Thessaloniki -GR". Both styles are handled here.
+     * Returns the first match found, or null if the sheet contains no
+     * EXW signal at all.
+     */
+    private detectSheetLevelExw(rows: any[][]): string | null {
+        for (const row of rows) {
+            if (!row) continue;
+            const v = this.extractExwFromCells(row);
+            if (v) return v;
+        }
+        return null;
+    }
+
+    /**
+     * 2-letter country code → full country name. Suppliers often shorthand
+     * the EXW location ("EXW IT", "Priced EXW GR") instead of writing the
+     * full country, especially in column headers. We expand to the full
+     * name so the buyer-facing PDP doesn't show cryptic "IT" or "GR".
+     */
+    private static readonly COUNTRY_ABBREV: Record<string, string> = {
+        IT: 'Italy', GR: 'Greece', DE: 'Germany', FR: 'France', ES: 'Spain',
+        PT: 'Portugal', RO: 'Romania', BG: 'Bulgaria', PL: 'Poland',
+        NL: 'Netherlands', BE: 'Belgium', AT: 'Austria', CZ: 'Czechia',
+        SK: 'Slovakia', HU: 'Hungary', SI: 'Slovenia', HR: 'Croatia',
+        DK: 'Denmark', SE: 'Sweden', FI: 'Finland', NO: 'Norway',
+        IE: 'Ireland', LU: 'Luxembourg', CH: 'Switzerland', LI: 'Liechtenstein',
+        EE: 'Estonia', LV: 'Latvia', LT: 'Lithuania', MT: 'Malta', CY: 'Cyprus',
+        GB: 'United Kingdom', UK: 'United Kingdom', IS: 'Iceland',
+        US: 'United States', CA: 'Canada', MX: 'Mexico',
+        TR: 'Turkey', RU: 'Russia', UA: 'Ukraine',
+        EG: 'Egypt', SA: 'Saudi Arabia', AE: 'UAE', QA: 'Qatar',
+        KW: 'Kuwait', BH: 'Bahrain', OM: 'Oman', JO: 'Jordan', LB: 'Lebanon',
+        MA: 'Morocco', TN: 'Tunisia', DZ: 'Algeria', LY: 'Libya',
+        CN: 'China', JP: 'Japan', KR: 'South Korea', IN: 'India',
+        TH: 'Thailand', VN: 'Vietnam', SG: 'Singapore', MY: 'Malaysia',
+        ID: 'Indonesia', PH: 'Philippines',
+        AU: 'Australia', NZ: 'New Zealand', BR: 'Brazil',
+    };
+
+    /**
+     * Expand 2-letter country codes inside an EXW string. "IT" alone
+     * becomes "Italy"; "Thessaloniki -GR" becomes "Thessaloniki, Greece";
+     * "Hamburg, DE" becomes "Hamburg, Germany". Leaves already-spelled-out
+     * names untouched.
+     */
+    private expandCountryAbbrev(value: string): string {
+        const v = value.trim();
+        // Pure 2-letter code → full country name.
+        if (/^[A-Za-z]{2}$/.test(v)) {
+            const full = ExcelService.COUNTRY_ABBREV[v.toUpperCase()];
+            if (full) return full;
+        }
+        // "City -GR" / "City, GR" / "City GR" → "City, <Country>"
+        const m = v.match(/^(.+?)[\s,\-]+([A-Za-z]{2})\s*$/);
+        if (m) {
+            const country = ExcelService.COUNTRY_ABBREV[m[2].toUpperCase()];
+            if (country) return `${m[1].trim()}, ${country}`;
+        }
+        return v;
+    }
+
+    /**
+     * Pull an EXW value out of a single row's cells. Recognises:
+     *   "EXW Thessaloniki"           → "Thessaloniki"
+     *   "EXW: Thessaloniki -GR"      → "Thessaloniki, Greece"
+     *   "Ex Works Hamburg, Germany"  → "Hamburg, Germany"
+     *   "Prices are EXW Hamburg"     → "Hamburg"
+     *   "Origin warehouse: Bucharest"→ "Bucharest"
+     *   "Price & EXW in IT"          → "Italy"
+     *   "EXW GR"                     → "Greece"
+     * Stops at the first newline or pipe so multi-field cells don't bleed.
+     */
+    private extractExwFromCells(row: any[]): string | null {
+        if (!row) return null;
+        const patterns: RegExp[] = [
+            // "EXW in IT", "EXW at GR", "EXW from Hamburg" — common in headers
+            /\bexw\s+(?:in|at|from)\s+([^\n|]+?)(?:[.,;)]|$)/i,
+            /\bexw\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+            /\bex\s*works?\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+            /\borigin\s*warehouse\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+            /\bship(?:ped)?\s*from\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+            /\bstock\s*location\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+            /\bpickup\s*location\s*[:\-]?\s*([^\n|]+?)(?:[.,;)]|$)/i,
+        ];
+        for (const cell of row) {
+            const s = String(cell ?? '').trim();
+            if (!s || s.length < 3 || s.length > 300) continue;
+            for (const re of patterns) {
+                const m = s.match(re);
+                if (m && m[1]) {
+                    let v = m[1].trim().replace(/^[\-:\s]+/, '').replace(/\s{2,}/g, ' ');
+                    // Strip trailing junk like "Price", "Cost", "EUR"
+                    v = v.replace(/\s+(price|cost|eur|usd|gbp|in|at|from)$/i, '').trim();
+                    if (v.length >= 2 && /[a-zA-Z؀-ۿ]/.test(v)) {
+                        return this.expandCountryAbbrev(v).slice(0, 80);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Shared row processor — used by both AI-mapped and heuristic-mapped
+     * paths. Takes a column-index → field-name mapping and turns each data
+     * row into a validated DTO instance.
+     */
+    private async processWithMapping(
+        rows: any[][],
+        mapping: Record<number, string | null>,
+        headerRowIndex: number,
+        dtoClass: any,
+        imageMapping: Record<number, string>,
+    ): Promise<ExcelReport> {
+        const results: ValidationRow[] = [];
+        let successCount = 0;
+        let errorCount = 0;
+
+        for (let i = headerRowIndex + 1; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row) continue;
+            const hasData = row.some(c => c !== undefined && c !== null && String(c).trim() !== '');
+            if (!hasData) continue;
+
+            const normalizedRow: Record<string, any> = {};
+            row.forEach((cell, idx) => {
+                const targetKey = mapping[idx];
+                if (!targetKey) return;
+                if (cell === undefined || cell === null || String(cell).trim() === '') return;
+                if (normalizedRow[targetKey] !== undefined) return;
+                normalizedRow[targetKey] = cell;
+            });
+
+            this.coerceTypes(normalizedRow);
+
+            if (imageMapping[i]) {
+                normalizedRow.images = [imageMapping[i]];
+            }
+
+            // Log first 3 extracted rows for verification
+            if (i - headerRowIndex <= 3) {
+                this.logger.log(`[ExcelService] Row ${i + 1}: ${JSON.stringify({
+                    name: normalizedRow.name,
+                    ean: normalizedRow.ean,
+                    price: normalizedRow.price,
+                    stock: normalizedRow.stock,
+                    unitsPerCase: normalizedRow.unitsPerCase,
+                    casesPerPallet: normalizedRow.casesPerPallet,
+                    unitsPerPallet: normalizedRow.unitsPerPallet,
+                    shelfLife: normalizedRow.shelfLife,
+                })}`);
+            }
+
+            const instance = plainToInstance(dtoClass, normalizedRow, { enableImplicitConversion: true });
+            const errors = await validate(instance as any);
+
+            if (errors.length > 0) {
+                errorCount++;
+                results.push({
+                    rowNumber: i + 1,
+                    success: false,
+                    errors: errors.map(err => `${err.property}: ${Object.values(err.constraints || {}).join(', ')}`),
+                });
+            } else {
+                successCount++;
+                results.push({ rowNumber: i + 1, success: true, data: instance });
+            }
+        }
+
+        return { totalRows: results.length, successCount, errorCount, results };
+    }
+
+    /**
+     * Returns true if the row is a footer / policy note rather than a real
+     * product. Heuristic: only the name field is meaningful (no EAN, no
+     * non-zero price, no logistics counts) AND the name contains a known
+     * note keyword. Examples that should be skipped:
+     *
+     *   "Minimum Order 6 pallets mixed - Prices are EXW Thessaloniki -GR"
+     *   "All prices in EUR. VAT not included."
+     *   "Note: deliveries Mon-Fri only"
+     *
+     * Without this guard those text rows land in the DB as zero-price
+     * products and clutter the catalog.
+     */
+    private isNoteRow(row: Record<string, any>): boolean {
+        const hasEan = row.ean && String(row.ean).trim().length > 0;
+        const hasPrice = typeof row.price === 'number' && row.price > 0;
+        const hasLogistics = !!(row.unitsPerCase || row.casesPerPallet || row.unitsPerPallet || row.palletsPerShipment);
+        if (hasEan || hasPrice || hasLogistics) return false; // real product, keep
+
+        const name = String(row.name || '').toLowerCase().trim();
+        if (!name) return true; // empty rows → skip (won't validate anyway)
+
+        // Single short brand-label row (e.g. just "SWIFFER" or "TENA") —
+        // Greek/EU suppliers often write the brand on its own row before
+        // the listing block. Detect: name is short (≤ 2 words), no EAN,
+        // no price, no logistics, and no descriptive content. Treat as
+        // a section header, not a product.
+        const wordCount = name.split(/\s+/).filter(Boolean).length;
+        if (wordCount <= 2 && name.length <= 25) return true;
+
+        const noteSignals = [
+            'minimum order', 'min order', 'min. order',
+            'prices are', 'all prices', 'incl. vat', 'excl. vat',
+            'exw ', 'fob ', 'cif ', 'ddp ', 'delivery terms', 'incoterms',
+            'note:', 'notes:', 'remarks:', 'terms:', 'conditions:',
+            'mixed pallets', 'pallets mixed', 'mixed cases',
+            'price list', 'offer valid', 'valid until',
+            'thank you', 'thessaloniki',
+        ];
+        return noteSignals.some(sig => name.includes(sig));
+    }
+
+    /**
+     * Pull brand + weight out of the product name when the sheet didn't
+     * supply them as their own columns. The user's specific request:
+     *
+     *   "if the customer types Pepsi Diet 150ml in the product name,
+     *    you take 'Pepsi' as the brand and '150ml' as the weight"
+     *
+     * Brand: first capitalised word, when no brand column was mapped.
+     *        Common known brands also recognised case-insensitive.
+     * Weight: regex /(\d+(?:[.,]\d+)?\s*(?:ml|l|g|kg|oz|lb|pcs|cl))/i.
+     *
+     * Both are only set when the row doesn't already have them — never
+     * overwrites a value the supplier explicitly provided.
+     */
+    private enrichFromName(row: Record<string, any>) {
+        const name = String(row.name || '').trim();
+        if (!name) return;
+
+        // Weight extraction
+        if (!row.weight) {
+            const weightMatch = name.match(/(\d+(?:[.,]\d+)?\s*(?:ml|l|kg|g|oz|lb|cl|cm|mm))\b/i);
+            if (weightMatch) row.weight = weightMatch[1].replace(/\s+/g, '').toLowerCase();
+        }
+
+        // Brand extraction
+        if (!row.brand) {
+            // Known brands first — case-insensitive, partial-match on word boundary.
+            const KNOWN = [
+                'Nestle', 'Nestlé', 'Pepsi', 'Coca-Cola', 'Coca Cola', 'Red Bull',
+                'KitKat', 'Kit Kat', 'Tena', 'Pampers', 'Always',
+                'P&G', 'Procter', 'Unilever', 'Mars', 'Ferrero', 'Kellogg',
+                'Haribo', 'Storck', 'Bahlsen', 'Lindt', 'Cadbury', 'Hershey',
+                'Trolli', 'Nesquik', 'Lipton', 'Ahmad', 'Twinings',
+                'Lay\'s', 'Pringles', 'Doritos', 'Tony\'s Chocolonely',
+                'Ritter Sport', 'Milka', 'Toblerone',
+                'Swiffer', 'Ariel', 'Tide', 'Persil', 'Comfort',
+            ];
+            const lower = name.toLowerCase();
+            for (const b of KNOWN) {
+                const re = new RegExp(`\\b${b.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b`, 'i');
+                if (re.test(name) || lower.includes(b.toLowerCase())) {
+                    row.brand = b;
+                    break;
+                }
+            }
+            // Fallback: first capitalised token (≥3 chars), unless it's the
+            // weight or a generic word. Better than no brand at all.
+            if (!row.brand) {
+                const firstWord = name.split(/\s+/)[0];
+                if (firstWord && firstWord.length >= 3 && /^[A-Z]/.test(firstWord) && !/^\d/.test(firstWord)) {
+                    row.brand = firstWord;
+                }
+            }
+        }
+    }
+
+    private coerceTypes(row: Record<string, any>) {
+        const arabicToEnglish = (s: string) => {
+            const map: any = { '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4', '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9' };
+            return s.replace(/[٠-٩]/g, m => map[m]);
+        };
+
+        // ── Helper: strip "C24" / "P12" prefix formats to get the number ──────
+        const parseQtyField = (raw: any): number => {
+            if (raw === undefined || raw === null) return 0;
+            // Handle "C24", "P12", "c 24", Arabic numerals, commas as decimals, etc.
+            const s = arabicToEnglish(String(raw))
+                .replace(/^[a-zA-Z\s]+/, '') // strip leading letters (C, P, BOX …)
+                .replace(/,/g, '.')           // European decimal comma → dot
+                .replace(/[^0-9.]/g, '');
+            const v = parseFloat(s);
+            return isNaN(v) ? 0 : Math.round(v); // logistics fields are always integers
+        };
+
+        // Force strings
+        if (row.name !== undefined && row.name !== null) row.name = String(row.name).trim();
+        if (row.description !== undefined && row.description !== null) row.description = String(row.description).trim();
+        if (row.category !== undefined && row.category !== null) row.category = String(row.category).trim();
+        if (row.ean !== undefined && row.ean !== null) {
+            // Strip every non-digit character (and keep an X for ISBN-10
+            // checksums, just in case). Excel exports often append a trailing
+            // period or comma to long numeric strings — the previous trim()
+            // only stripped whitespace, leaving "7322541412405." which sent
+            // a malformed lookup to Open Food Facts and returned 404.
+            row.ean = String(row.ean).replace(/[^0-9X]/gi, '');
+
+            // Format-validate the EAN. Real product barcodes are EAN-13,
+            // EAN-8, UPC-A (12), or ITF-14 (14). Anything else — usually a
+            // supplier's internal SKU like "11042" — is NOT a barcode and
+            // should be dropped, otherwise we send malformed lookups to
+            // every external API and pollute the DB with phantom EANs.
+            //
+            // The Excel parser also maps "itemnumber" → ean (because some
+            // suppliers really do put barcodes in that column), so this
+            // length guard is the only thing keeping internal SKUs out.
+            const validLengths = [8, 12, 13, 14];
+            if (!row.ean || !validLengths.includes(row.ean.length)) {
+                row.ean = undefined;
+            }
+        }
+        if (row.brand !== undefined && row.brand !== null) row.brand = String(row.brand).trim();
+        if (row.unit !== undefined && row.unit !== null) row.unit = String(row.unit).trim().toLowerCase();
+        if (row.shelfLife !== undefined && row.shelfLife !== null) {
+            // Date normalisation pipeline. shelfLife can arrive in three
+            // flavours:
+            //   1) Excel serial number  (44927.0  → "2023-01-01")
+            //   2) Excel ISO timestamp  ("2026-12-31T00:00:00.000Z")
+            //   3) Plain YYYYMMDD       ("20260731")
+            // We always emit ISO YYYY-MM-DD so the BBD field on the
+            // product detail page renders consistently and the supplier
+            // can read it without thinking "what's 46387.083?".
+            const raw = row.shelfLife;
+            const rawStr = String(raw).trim();
+
+            // Case 1: numeric (Excel serial) — values between 30000-60000
+            // correspond to ~1982-2064, the realistic BBD window.
+            const asNumber = typeof raw === 'number' ? raw : parseFloat(rawStr);
+            if (!isNaN(asNumber) && asNumber > 30000 && asNumber < 70000 && !/-/.test(rawStr)) {
+                // Excel serial dates are days since 1900-01-01 (with the
+                // famous 1900-leap-year bug, hence +1 offset).
+                const epochMs = (asNumber - 25569) * 86400 * 1000;
+                const d = new Date(epochMs);
+                if (!isNaN(d.getTime())) {
+                    row.shelfLife = d.toISOString().slice(0, 10);
+                }
+            } else if (/^\d{4}-\d{2}-\d{2}T/.test(rawStr)) {
+                // Case 2: ISO timestamp — keep just the date portion.
+                row.shelfLife = rawStr.slice(0, 10);
+            } else if (/^\d{8}$/.test(rawStr)) {
+                // Case 3: YYYYMMDD compact — insert dashes.
+                row.shelfLife = `${rawStr.slice(0, 4)}-${rawStr.slice(4, 6)}-${rawStr.slice(6, 8)}`;
+            } else {
+                row.shelfLife = rawStr;
+            }
+        }
+
+        // Force price to number (handle European decimals like "1.58", "0.38")
+        if (row.price !== undefined && row.price !== null) {
+            // Capture the RAW cell value before any cleanup, so the
+            // diagnostic log can tell us whether a 15.48 stored basePrice
+            // came from the supplier file (cell already had decimals,
+            // formatted to look integer) or from our pipeline. The Logger
+            // print happens at the controller after coerceTypes returns.
+            const rawCellPrice = row.price;
+            const cleanStr = arabicToEnglish(String(row.price))
+                .replace(/,/g, '.')
+                .replace(/[^0-9.-]/g, '');
+            const p = parseFloat(cleanStr);
+            row.price = isNaN(p) ? 0 : p;
+            // Tag the row so the controller can include the raw value in
+            // its per-row trace log. Plain object property — not part of
+            // the DTO contract; controller deletes it before persisting.
+            (row as any).__rawPriceCell = rawCellPrice;
+        }
+
+        // Force stock to number — strip "in CASES" suffix if present
+        if (row.stock !== undefined && row.stock !== null) {
+            const cleanStr = arabicToEnglish(String(row.stock)).replace(/[^0-9-]/g, '');
+            const s = parseInt(cleanStr, 10);
+            row.stock = isNaN(s) ? 10 : Math.min(Math.max(s, 0), 2147483647);
+        }
+
+        // Logistics fields — all handle "C24" / "P403" style values
+        if (row.unitsPerCase !== undefined && row.unitsPerCase !== null) {
+            row.unitsPerCase = parseQtyField(row.unitsPerCase);
+        }
+        if (row.casesPerPallet !== undefined && row.casesPerPallet !== null) {
+            row.casesPerPallet = parseQtyField(row.casesPerPallet);
+        }
+        if (row.unitsPerPallet !== undefined && row.unitsPerPallet !== null) {
+            // If both unitsPerCase and casesPerPallet are set, derive unitsPerPallet
+            if (row.unitsPerCase && row.casesPerPallet) {
+                row.unitsPerPallet = row.unitsPerCase * row.casesPerPallet;
+            } else {
+                row.unitsPerPallet = parseQtyField(row.unitsPerPallet);
+            }
+        } else if (row.unitsPerCase && row.casesPerPallet) {
+            // Auto-derive unitsPerPallet even if column wasn't in the file
+            row.unitsPerPallet = row.unitsPerCase * row.casesPerPallet;
+        }
+
+        if (row.palletsPerShipment !== undefined && row.palletsPerShipment !== null) {
+            row.palletsPerShipment = parseQtyField(row.palletsPerShipment);
+        }
+
+        // MOQ / minOrder — minimum order quantity (integer ≥ 1)
+        if (row.moq !== undefined && row.moq !== null) {
+            const v = parseQtyField(row.moq);
+            row.moq = v >= 1 ? v : undefined; // ignore 0 / invalid
+        }
+        // moqUnit — accept common spellings; default to PIECE.
+        if (row.moqUnit !== undefined && row.moqUnit !== null) {
+            const raw = String(row.moqUnit).trim().toUpperCase();
+            const norm =
+                raw.includes('TRUCK') || raw.includes('CONTAINER') ? 'TRUCK' :
+                raw.includes('PALLET') ? 'PALLET' :
+                raw.includes('CASE') || raw.includes('CARTON') || raw.includes('BOX') ? 'CASE' :
+                raw.includes('PIECE') || raw.includes('PCS') || raw === 'PC' || raw === 'UNIT' ? 'PIECE' :
+                undefined;
+            row.moqUnit = norm; // undefined falls back to schema default 'PIECE'
+        }
+
+        // ── Image URL parsing ──────────────────────────────────────────────
+        // Supports a single URL, or multiple URLs separated by:
+        //   newline, comma, semicolon, pipe, or whitespace+http
+        // Embedded-image base64 strings (already injected upstream) are
+        // preserved as-is — only string-typed cells get parsed.
+        if (row.images !== undefined && row.images !== null) {
+            const raw = row.images;
+            if (Array.isArray(raw)) {
+                row.images = raw.filter((x: any) => typeof x === 'string' && x.trim().length > 0);
+            } else if (typeof raw === 'string') {
+                const cell = raw.trim();
+                if (cell.startsWith('data:image')) {
+                    // already base64-injected
+                    row.images = [cell];
+                } else {
+                    // Split on common separators, then keep only valid http(s) URLs
+                    const parts = cell
+                        .split(/[\n\r\t,;|]+|\s(?=https?:\/\/)/g)
+                        .map((p: string) => p.trim())
+                        .filter((p: string) => /^https?:\/\//i.test(p));
+                    row.images = parts;
+                }
+            }
+            if (!Array.isArray(row.images) || row.images.length === 0) {
+                delete row.images;
+            }
+        }
+
+        // ── Smart description-as-name promotion ────────────────────────────
+        // Common supplier mistake: they paste the actual product label into
+        // the Description column (e.g. "Trolli Sour Brite Crawlers 142g"),
+        // and either leave Name empty or stuff it with an SKU like "P00321".
+        //
+        // Heuristics (no AI calls — runs per-row, must be cheap):
+        //   - Name is "Unnamed Product", a pure number/code (e.g. P12, 12345),
+        //     or shorter than 4 chars
+        //   - Description is between 4 and 120 chars, contains at least one
+        //     alphabetic word, and looks like a product label (not a sentence)
+        //
+        // If both hold, we promote Description → Name and leave Description
+        // empty (it'll be regenerated by AI later).
+        const looksLikeCodeOrEmpty = (s: string): boolean => {
+            const t = (s || '').trim();
+            if (!t || t === 'Unnamed Product') return true;
+            if (t.length < 4) return true;
+            // Pure SKU patterns: P12, C24, ABC-001, 123456
+            if (/^[a-z]{0,3}[-_ ]?\d{1,8}$/i.test(t)) return true;
+            // Mostly digits or pure numbers
+            if (/^\d+([.,]\d+)?$/.test(t)) return true;
+            return false;
+        };
+        const looksLikeProductName = (s: string): boolean => {
+            const t = (s || '').trim();
+            if (t.length < 4 || t.length > 160) return false;
+            // Must contain at least one word with letters
+            if (!/[a-zA-Z؀-ۿ]{2,}/.test(t)) return false;
+            // Reject sentence-y descriptions (multiple sentence terminators)
+            if ((t.match(/[.!?؟]/g) || []).length >= 2) return false;
+            // Reject typical descriptive sentences ("This product…", "Made of…")
+            if (/^(this|the|a |an |made of|made from|contains|ingredients)/i.test(t)) return false;
+            return true;
+        };
+        const nameStr = row.name !== undefined && row.name !== null ? String(row.name) : '';
+        const descStr = row.description !== undefined && row.description !== null ? String(row.description) : '';
+        if (looksLikeCodeOrEmpty(nameStr) && looksLikeProductName(descStr)) {
+            // Preserve the SKU/code in `ean` if we don't already have one
+            if (!row.ean && nameStr && !looksLikeProductName(nameStr)) {
+                row.ean = nameStr;
+            }
+            row.name = descStr.trim();
+            row.description = '';
+        }
+
+        // Defaults for missing required fields
+        if (!row.name || String(row.name).trim() === '') row.name = 'Unnamed Product';
+        if (!row.category || String(row.category).trim() === '') row.category = 'General';
+        if (!row.description) row.description = "";
+        if (row.price === undefined || row.price === null) row.price = 0;
+        if (row.stock === undefined || row.stock === null) row.stock = 10;
+    }
+
+    private async processJsonRows(jsonRows: Record<string, any>[], keyMapping: Record<string, string>, dtoClass: any): Promise<ExcelReport> {
+        const results: ValidationRow[] = [];
+        let successCount = 0;
+        let errorCount = 0;
+
+        for (let i = 0; i < jsonRows.length; i++) {
+            const raw = jsonRows[i];
+            const hasData = Object.values(raw).some(v => v !== undefined && v !== null && String(v).trim() !== '');
+            if (!hasData) continue;
+
+            const normalizedRow: Record<string, any> = {};
+            for (const [originalKey, value] of Object.entries(raw)) {
+                const targetKey = keyMapping[originalKey];
+                if (targetKey) {
+                    normalizedRow[targetKey] = value;
+                } else {
+                    const nk = originalKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+                    if (['name', 'description', 'price', 'stock', 'category', 'ean'].includes(nk)) {
+                        normalizedRow[nk] = value;
+                    }
+                }
+            }
+
+            this.coerceTypes(normalizedRow);
+
+            if (i === 0) {
+                console.log('[ExcelService] First JSON row after coercion:', JSON.stringify(normalizedRow));
+            }
+
+            const instance = plainToInstance(dtoClass, normalizedRow, { enableImplicitConversion: true });
+            const errors = await validate(instance as any);
+
+            if (errors.length > 0) {
+                errorCount++;
+                const errorMessages = errors.map(err =>
+                    `${err.property}: ${Object.values(err.constraints || {}).join(', ')}`
+                );
+                results.push({ rowNumber: i + 2, success: false, errors: errorMessages });
+            } else {
+                successCount++;
+                results.push({ rowNumber: i + 2, success: true, data: instance });
+            }
+        }
+
+        return { totalRows: results.length, successCount, errorCount, results };
+    }
+
+    /**
+     * Attempts to extract floating/embedded images from the XLSX ZIP archive.
+     * Returns a map of row indices (0-based) to base64 data URIs.
+     */
+    private async extractImagesFromZip(buffer: Buffer, sheetName: string): Promise<Record<number, string>> {
+        const imageMapping: Record<number, string> = {};
+        try {
+            const zip = await JSZip.loadAsync(buffer);
+
+            // XLSX structure:
+            // xl/worksheets/sheet1.xml -> defines relationship to drawing (e.g. rId1)
+            // xl/worksheets/_rels/sheet1.xml.rels -> maps rId1 to Target="../drawings/drawing1.xml"
+            // xl/drawings/drawing1.xml -> defines anchor cells (row/col) and relationship to image (e.g. rId1)
+            // xl/drawings/_rels/drawing1.xml.rels -> maps rId1 to Target="../media/image1.jpeg"
+            // xl/media/image1.jpeg -> actual physical image
+
+            // Simplify: Just find drawing1.xml and its rels for now, assuming 1 main sheet.
+            let drawingPath: string | null = null;
+            let relsPath: string | null = null;
+
+            // Find drawings
+            zip.folder('xl/drawings/')?.forEach((relativePath, file) => {
+                if (relativePath.endsWith('.xml') && !relativePath.includes('_rels')) {
+                    drawingPath = `xl/drawings/${relativePath}`;
+                    relsPath = `xl/drawings/_rels/${relativePath}.rels`;
+                }
+            });
+
+            if (!drawingPath || !relsPath) {
+                console.log('[ExcelService] No drawings found in workbook.');
+                return imageMapping;
+            }
+
+            const drawingXml = await zip.file(drawingPath)?.async('string');
+            const relsXml = await zip.file(relsPath)?.async('string');
+
+            if (!drawingXml || !relsXml) return imageMapping;
+
+            // Simple regex parsers (XML parsing in Node can be heavy, regex is sufficient for standard anchors)
+            // Parse rels to map rId -> media path
+            const relMap: Record<string, string> = {};
+            const relMatchRegex = /<Relationship[^>]+Id="([^"]+)"[^>]+Target="([^"]+)"/g;
+            let relMatch;
+            while ((relMatch = relMatchRegex.exec(relsXml)) !== null) {
+                const target = relMatch[2]; // e.g. "../media/image1.jpeg"
+                const cleanTarget = target.replace('../', 'xl/');
+                relMap[relMatch[1]] = cleanTarget;
+            }
+
+            // Parse drawings to map row -> rId
+            // TwoCellAnchor or OneCellAnchor contain <xdr:from><xdr:row>Y</xdr:row>... and <a:blip r:embed="rIdX">
+            const anchorBlocks = drawingXml.split(/<xdr:(?:one|two)CellAnchor/i);
+
+            for (let i = 1; i < anchorBlocks.length; i++) {
+                const block = anchorBlocks[i];
+
+                // Extract Row
+                const rowMatch = block.match(/<xdr:row>([^<]+)<\/xdr:row>/);
+                if (!rowMatch) continue;
+                const rowIndex = parseInt(rowMatch[1], 10);
+
+                // Extract embed ID
+                const embedMatch = block.match(/<a:blip[^>]*r:embed="([^"]+)"/i);
+                if (!embedMatch) continue;
+                const embedId = embedMatch[1];
+
+                const mediaPath = relMap[embedId];
+                if (mediaPath && rowIndex >= 0) {
+                    const mediaFile = zip.file(mediaPath);
+                    if (mediaFile) {
+                        const ext = mediaPath.split('.').pop()?.toLowerCase() || 'jpeg';
+                        const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+                        const base64 = await mediaFile.async('base64');
+                        imageMapping[rowIndex] = `data:${mime};base64,${base64}`;
+                    }
+                }
+            }
+
+            return imageMapping;
+        } catch (error) {
+            console.error('[ExcelService] Error extracting images from ZIP:', error);
+            return {};
+        }
+    }
+
+    async generateOrdersExcel(orders: any[]): Promise<Buffer> {
+        const data = orders.map(order => ({
+            'Order ID': order.id,
+            'Date': new Date(order.date).toLocaleDateString(),
+            'Status': order.status,
+            'Customer Name': order.customer,
+            'Supplier Name': order.supplier,
+            'Total Amount': order.total,
+            'Supplier Share': order.supplierProfit || 0,
+            'Admin Commission': order.adminProfit || 0,
+            'Shipping Company': order.shippingCompany || 'N/A',
+            'Shipping Cost': order.shippingCost || 0,
+            'Order Items': order.items.map((i: any) => `${i.product} (x${i.quantity})`).join('; ')
+        }));
+
+        const worksheet = XLSX.utils.json_to_sheet(data);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'Detailed Orders');
+        
+        return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    }
+
+    async generateFinancialStatementExcel(summary: any, transactions: any[]): Promise<Buffer> {
+        const workbook = XLSX.utils.book_new();
+
+        // 1. Summary Sheet
+        const summaryRows = [
+            ['Atlantis Financial Statement'],
+            ['Generated At', new Date().toLocaleString()],
+            ['Period', summary.period],
+            [],
+            ['Metrics', 'Value'],
+            ['Total Orders', summary.totalOrders],
+            ['Gross Revenue', summary.totalRevenue],
+            ['Platform Gross Profit', summary.platformRevenue],
+            ['Supplier Net Payouts', summary.supplierRevenue],
+            ['Paid Orders', summary.paidOrders],
+            ['Pending Orders', summary.pendingOrders],
+            ['Cancelled Orders', summary.cancelledOrders],
+        ];
+        const summarySheet = XLSX.utils.aoa_to_sheet(summaryRows);
+        XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+
+        // 2. Transactions Sheet
+        const txData = transactions.map(tx => ({
+            'Order ID': tx.orderId,
+            'Date': tx.createdAt,
+            'Status': tx.status,
+            'Total Amount': tx.totalAmount,
+            'Platform Fee': tx.platformFee,
+            'Supplier Share': tx.supplierAmount,
+            'Payment Status': tx.paymentStatus,
+            'Settled': tx.escrowStatus === 'RELEASED' ? 'Yes' : 'No'
+        }));
+        const txSheet = XLSX.utils.json_to_sheet(txData);
+        XLSX.utils.book_append_sheet(workbook, txSheet, 'Transactions');
+
+        // 3. Full Details Sheet (Combined)
+        const fullDetailsData = [
+            ['Financial Statement Full Export'],
+            ['Total Platform Revenue', summary.totalRevenue],
+            ['Platform Gross Profit', summary.platformRevenue],
+            ['Supplier Net Payouts', summary.supplierRevenue],
+            [],
+            ['Transaction Details'],
+            ...txData.map(tx => Object.values(tx))
+        ];
+        const fullDetailsSheet = XLSX.utils.aoa_to_sheet(fullDetailsData);
+        XLSX.utils.book_append_sheet(workbook, fullDetailsSheet, 'Full Details');
+
+        return XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' });
+    }
+}

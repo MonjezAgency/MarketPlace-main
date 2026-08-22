@@ -1,0 +1,153 @@
+'use client';
+
+import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+
+export interface CartItem {
+    /**
+     * Cart-line identifier. For configurable products this is the
+     * product id PLUS a variant signature (`<productId>::Size=Large|Flavour=Vanilla`)
+     * so the same product at two different variant combos lives as
+     * two distinct cart lines instead of merging into one. For
+     * single-config products this is just the product id.
+     */
+    id: string;
+    /**
+     * The pure product id, without the variant signature suffix. Used
+     * when checking out so the backend can look up the underlying
+     * product (orders.productId, stock guards, etc.) without parsing
+     * the cart-line key. Optional for backwards-compat with old cart
+     * entries that pre-date this field — falls back to `id` then.
+     */
+    productId?: string;
+    name: string;
+    brand: string;
+    price: number;
+    image: string;
+    quantity: number;
+    unit: string;
+    category?: string;
+    supplierId?: string;
+    /**
+     * The tier the buyer locked in on the product detail page.
+     * Once a product is in the cart at a given tier, the PDP forces
+     * any further interaction with the same product to that same
+     * tier — buyers can't mix Truck pricing with Pallet pricing for
+     * the same SKU. To switch tier, they must remove the line item
+     * first. `unit` carries a human label ("Truck", "Pallet",
+     * "Case"); `tier` is the canonical key the PDP locks on.
+     */
+    tier?: 'truck' | 'pallet' | 'carton';
+    /**
+     * Shopify-style variant picks for configurable products, e.g.
+     *   { "Size": "Large", "Flavour": "Vanilla" }
+     * Travels with the cart line into the order so the admin can
+     * see the exact configuration the buyer ordered.
+     */
+    selectedVariants?: Record<string, string>;
+    /**
+     * Mixed-tier composition. When the buyer used the PDP's
+     * "Mix this <tier>" composer, this holds the per-variant
+     * breakdown:
+     *   [ { signature: "Flavour=Diet",    quantity: 5,  unitPrice: 290.00 },
+     *     { signature: "Flavour=Regular", quantity: 10, unitPrice: 264.00 } ]
+     * The line's `quantity` stays 1 (= one mixed tier-unit), and
+     * `price` is the full marked-up total. Survives the round-trip
+     * to the order API where it lands on OrderItem.mixComposition.
+     */
+    mixComposition?: Array<{ signature: string; quantity: number; unitPrice: number }>;
+}
+
+interface CartContextType {
+    items: CartItem[];
+    addItem: (item: Omit<CartItem, 'quantity'>, qty?: number) => void;
+    removeItem: (id: string) => void;
+    updateQuantity: (id: string, qty: number) => void;
+    clearCart: () => void;
+    total: number;
+}
+
+const CartContext = createContext<CartContextType>({
+    items: [],
+    addItem: () => { },
+    removeItem: () => { },
+    updateQuantity: () => { },
+    clearCart: () => { },
+    total: 0,
+});
+
+// Cart key is scoped per user so switching accounts never leaks items
+function getCartKey(): string {
+    if (typeof window === 'undefined') return 'bev-cart-guest';
+    try {
+        // Read user id from /api/auth/me response cached in window, or fall back to guest
+        const stored = sessionStorage.getItem('bev-uid');
+        return stored ? `bev-cart-${stored}` : 'bev-cart-guest';
+    } catch {
+        return 'bev-cart-guest';
+    }
+}
+
+export function CartProvider({ children }: { children: ReactNode }) {
+    const [items, setItems] = useState<CartItem[]>([]);
+    const [cartKey, setCartKey] = useState<string>('bev-cart-guest');
+
+    // Detect user-id changes (login / logout) and reload the correct cart
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const syncKey = () => {
+            const key = getCartKey();
+            setCartKey(key);
+            try {
+                const saved = localStorage.getItem(key);
+                setItems(saved ? JSON.parse(saved) : []);
+            } catch {
+                localStorage.removeItem(key);
+                setItems([]);
+            }
+        };
+        syncKey();
+        window.addEventListener('bev-auth-changed', syncKey);
+        return () => window.removeEventListener('bev-auth-changed', syncKey);
+    }, []);
+
+    // Persist to the current user's cart key
+    useEffect(() => {
+        if (typeof window !== 'undefined') {
+            localStorage.setItem(cartKey, JSON.stringify(items));
+        }
+    }, [items, cartKey]);
+
+    const addItem = (item: Omit<CartItem, 'quantity'>, qty = 1) => {
+        setItems(prev => {
+            const existing = prev.find(i => i.id === item.id);
+            if (existing) {
+                return prev.map(i => i.id === item.id ? { ...i, quantity: i.quantity + qty } : i);
+            }
+            return [...prev, { ...item, quantity: qty }];
+        });
+    };
+
+    const removeItem = (id: string) => {
+        setItems(prev => prev.filter(i => i.id !== id));
+    };
+
+    const updateQuantity = (id: string, qty: number) => {
+        if (qty <= 0) return removeItem(id);
+        setItems(prev => prev.map(i => i.id === id ? { ...i, quantity: qty } : i));
+    };
+
+    const clearCart = () => {
+        setItems([]);
+        if (typeof window !== 'undefined') localStorage.removeItem(cartKey);
+    };
+
+    const total = items.reduce((sum, i) => sum + i.price * i.quantity, 0);
+
+    return (
+        <CartContext.Provider value={{ items, addItem, removeItem, updateQuantity, clearCart, total }}>
+            {children}
+        </CartContext.Provider>
+    );
+}
+
+export const useCart = () => useContext(CartContext);
